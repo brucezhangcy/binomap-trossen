@@ -91,22 +91,29 @@ def clamp_to_hw_limits(action: torch.Tensor) -> torch.Tensor:
 
 
 def slow_move_to(robot, target_14: torch.Tensor, move_time_s: float, extra_settle_s: float) -> None:
-    """Send a single pose with a temporarily slowed driver, then settle.
+    """Drive every follower arm to its slice of `target_14` over `move_time_s`.
 
-    Same shape as `replay_state.slow_move_to`. The driver-level
-    `MIN_TIME_TO_MOVE` controls the trapezoidal interpolation duration that
-    the firmware uses to reach the goal.
+    Bypasses `robot.send_action()` — that path runs every goal through lerobot's
+    `max_relative_target` clamp (e.g. 0.2 rad), which is right for tick-by-tick
+    streaming but *wrong* for one-shot large repositionings (sleep → HOME, HOME
+    → trajectory start). With the clamp active, big slow-moves only travel the
+    clamp distance and stop short — when streaming then starts, the arm is far
+    from the trajectory's first pose and the per-tick clamp makes it crawl
+    toward the trajectory, looking like a "sudden move at the start".
+
+    Instead, talk to the underlying Trossen driver directly (the pattern used
+    in generate_goal_pc.py and park_pose.py). The firmware blends from current
+    → target over `move_time_s` regardless of magnitude, capped only by the
+    arm's own joint-velocity limits.
     """
-    saved = {}
-    for name, arm in robot.follower_arms.items():
-        saved[name] = arm.MIN_TIME_TO_MOVE
-        arm.MIN_TIME_TO_MOVE = move_time_s
-    try:
-        robot.send_action(target_14)
-        time.sleep(move_time_s + extra_settle_s)
-    finally:
-        for name, arm in robot.follower_arms.items():
-            arm.MIN_TIME_TO_MOVE = saved[name]
+    n_arms = len(robot.follower_arms)
+    target_np = target_14.cpu().numpy().astype(float)
+    assert target_np.shape == (n_arms * 7,), (
+        f"slow_move_to expects {n_arms * 7}-D target; got {target_np.shape}")
+    for i, (arm_name, arm) in enumerate(robot.follower_arms.items()):
+        pose = target_np[i * 7:(i + 1) * 7].tolist()
+        arm.driver.set_all_positions(pose, move_time_s, False)
+    time.sleep(move_time_s + extra_settle_s)
 
 
 def emergency_stop(robot, home_14: torch.Tensor, home_move_time_s: float) -> None:
@@ -199,6 +206,11 @@ def main():
     ap.add_argument("--cameras", nargs="+", default=None,
                     help="Subset of camera names to record (e.g. cam_high cam_low). "
                          "Default: record every camera in the connected robot config.")
+    ap.add_argument("--d455", choices=["high", "low", "both"], default=None,
+                    help="Record from the D455 workspace cam(s) instead of the lerobot-config "
+                         "cameras (which on this rig are D405 wrist cams + D435 center). "
+                         "'high' = serial 338122302972, 'low' = serial 333422304645. "
+                         "Implies --record.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Don't connect to hardware; just print the resolved 14-D actions + timing.")
     args = ap.parse_args()
@@ -276,6 +288,27 @@ def main():
         max_relative_target=args.max_step_delta,
         min_time_to_move_multiplier=1.0,
     )
+    # --d455 implies --record and REPLACES the lerobot config's cameras with
+    # the workspace D455(s) by serial. The yigit-env lerobot config doesn't
+    # know about the D455s — they're external workspace cams used directly via
+    # pyrealsense2 in brown_box_pointcloud.py.
+    if args.d455:
+        from lerobot.common.robot_devices.cameras.configs import IntelRealSenseCameraConfig
+        D455_CAMS = {
+            "cam_d455_high": IntelRealSenseCameraConfig(serial_number=338122302972,
+                                                        fps=30, width=640, height=480, use_depth=False),
+            "cam_d455_low":  IntelRealSenseCameraConfig(serial_number=333422304645,
+                                                        fps=30, width=640, height=480, use_depth=False),
+        }
+        if args.d455 == "high":
+            robot_cfg.cameras = {"cam_d455_high": D455_CAMS["cam_d455_high"]}
+        elif args.d455 == "low":
+            robot_cfg.cameras = {"cam_d455_low":  D455_CAMS["cam_d455_low"]}
+        else:  # both
+            robot_cfg.cameras = D455_CAMS
+        args.record = True
+        print(f"--d455 {args.d455} → recording from {list(robot_cfg.cameras.keys())}")
+
     # When NOT recording, clear cameras so robot.connect() doesn't require a
     # working RealSense rig. When recording, keep the default cam_high / cam_low
     # (optionally filter to a subset via --cameras).

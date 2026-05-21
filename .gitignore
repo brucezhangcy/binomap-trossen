@@ -44,3 +44,6 @@ clean_trajectory.py
 # IDE
 .vscode/
 .idea/
+
+# Local handoff: 1.9 GB archive of raw recordings, too big for github
+recordings_one_hand_fix.zip

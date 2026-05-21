@@ -929,3 +929,131 @@ If we later want to suppress those spurious detections explicitly, options are: 
 ### Status
 
 Stage 1 trajectory extraction now works for both clips. `recordings_one_hand_fix_7s` produces a geometrically sensible bimanual trajectory (~35 cm wrist separation, sub-mm IK convergence on Trossen). The MediaPipe path will likely be the new default for any clip where the demonstrator's hands aren't in a "natural" pose (knuckles-down, palm-up bracing, partial occlusion).
+
+## 2026-05-21 — Re-extracted brown box point cloud with arms parked
+
+Re-ran [brown_box_pointcloud.py](brown_box_pointcloud.py) while the bimanual arms were holding the goal-capture park pose (j1≈0.047, j2=0.700, j3=0.628, others 0 — both elbows swung forward, shoulders lifted, grippers above the workspace). The point was to capture a clean box-only cloud with zero arm geometry in the scene, since the previous May 20 capture was made with the arms in some neutral position.
+
+### Tooling change
+
+Added `--auto-click SERIAL,X,Y` (repeatable) and `--no-viewer` CLI flags to `brown_box_pointcloud.py`. The original script required an interactive cv2 click per camera + an Open3D viewer at the end; both blocked headless / background runs. With the new flags the script is fully non-interactive when given clicks up-front. Reused the prior session's click coordinates:
+
+```
+--auto-click 333422304645,359,263   # cam_low  (L)
+--auto-click 338122302972,361,226   # cam_high (R)
+```
+
+### Before / after
+
+| | May 20 (arms not parked) | May 21 (arms parked) |
+|---|---|---|
+| brown_box.ply pts | 60,656 | 35,580 |
+| AABB extent (m) | 0.300 × 0.393 × 0.167 | 0.278 × 0.372 × 0.164 |
+| AABB center (m) | (−0.009, −0.032, +0.102) | (+0.016, −0.022, +0.099) |
+| L cam masked px | 29,154 (10.8 %, score 0.985) | 29,425 (11.2 %, score 0.974) |
+| R cam masked px | 32,534 (13.8 %, score 0.816) | **6,178 (2.0 %, score 0.920)** |
+| DBSCAN clusters | 11 (largest 60,656) | 1 (35,580 — single clean cluster) |
+| scene.ply pts | 402,321 | 419,943 |
+
+Previous PLY preserved as `outputs/brown_box/brown_box.prev.ply` before overwrite.
+
+### What the deltas mean
+
+1. **AABB center shifted +2.5 cm in X, +1 cm in Y.** The box has physically moved on the table since the May 20 capture (someone bumped it, or it was repositioned). The same R-cam click `(361, 226)` no longer lands on the box centre — it lands closer to an edge, so SAM2 segments a much smaller visible face. L-cam mask is essentially unchanged because the click `(359, 263)` still lands inside the box body in that view.
+2. **R-cam contribution dropped 5×.** Despite that, the merged cloud is still a single clean DBSCAN cluster — the L cam alone provides 29 k points which already covers the full box surface visible from that angle.
+3. **Scene cloud got slightly bigger** (+17 k pts) — consistent with the arms being lifted out of the depth field-of-view (less arm geometry contaminating the workspace volume).
+4. **AABB extent shrank ~2 cm in X and Y, ~3 mm in Z.** With the arms gone, points that previously came from arm forearms (sitting near the edges of the workspace AABB) are no longer in the masked cloud → the box's own dimensions are reported more tightly.
+
+### Visualization
+
+4-view PNG (isometric / top / front / side) at `outputs/brown_box/visualize_compare.png` — new (left column) vs old (right column). Both clouds resolve to the same box from every angle; the new one is sparser but covers the same volume.
+
+### Files updated
+- `outputs/brown_box/brown_box.ply` — overwritten with the 35,580-pt cloud.
+- `outputs/brown_box/scene.ply` — overwritten with the 419,943-pt scene.
+- `outputs/brown_box/brown_box.prev.ply` — manual backup of the May 20 version.
+- `outputs/brown_box/visualize_compare.png` — new vs old side-by-side render.
+- `brown_box_pointcloud.py` — added `--auto-click` and `--no-viewer` flags (interactive default behaviour unchanged).
+
+### Headless invocation
+
+```bash
+/home/yunshuang/anaconda3/envs/depth_lerobot/bin/python brown_box_pointcloud.py \
+    --auto-click 333422304645,359,263 \
+    --auto-click 338122302972,361,226 \
+    --no-viewer
+```
+
+Hardware state during capture: both Trossen WX AI arms held in park pose by [park_pose.py](park_pose.py) (background process — position-mode actively locked, zero motion during the ~30 s SAM2 + capture pass).
+
+## 2026-05-21 — Stage 2b geometry-aware contact adjustment
+
+Implemented BiNoMaP §3.3 Stage 2b in [contact_adjustment.py](contact_adjustment.py). Takes a smoothed bimanual trajectory + object point cloud and emits an adjusted bundle where the primary arm is shifted toward the object surface; the user then iterates with the paper's γ=0.85 decay (max k ≤ 10 in the paper, extended as needed for our demo geometry) until the real-robot test makes contact.
+
+### Why it diverges from the paper's exact formula
+
+The paper assumes a bimanual sandwich grip — both arms in contact with the object at `t_s`. Our `recordings_1/wrist` demo is single-hand-active: L touches the box (within 0.9 mm at frame 166), R never approaches it (always ≥ 166 mm away, sits 17 cm above box top). So the paper's scaling `s_k = ‖new_R − L‖ / ‖orig_R − L‖` with R as primary and L as reference can't produce a real bimanual contact — it just slides R toward L's air-grip position.
+
+The adopted approach: translation-based per-arm shifts with **start-only decay** so the demo's end-of-motion is preserved (translating R uniformly creates a "shrunken trajectory" effect where R returns to a shifted position; start-only with linear decay to 0 by `t_end` keeps the demo trajectory intact except at the contact-establishment phase). γ=0.85 still drives the iteration step size, matching the paper.
+
+### Script features (`contact_adjustment.py`)
+
+| Flag | Purpose |
+|---|---|
+| `--mode {scale, translate}` | Paper's Eq. 11 scaling (default) vs. constant translation. Translation preserves the demo's inter-arm distance evolution; scaling shrinks it uniformly per iteration. |
+| `--apply-to {primary, both}` | Single arm (paper) vs. bilateral. Bilateral is needed when the demo lacks a clear primary-secondary roles. |
+| `--lateral-spread-mm`, `--lower-mm` | Translation knobs (constant shift for entire trajectory; box-decoupled). |
+| `--shift-R-y-start-mm`, `--lower-R-start-mm` | **Start-only** shifts per arm, decay linearly to 0 by the arm's last valid frame. Preserves demo end pose. Add `_L_` variants for L. |
+| `--distance-mm D` / `--iteration K` | Set d_k directly or via paper's `5 × 0.85^(K-1)` formula. |
+| `--tag NAME` | Custom suffix for `trajectory_contact_adj_<tag>.npz` to keep iterations distinct. |
+
+### Iteration framework used for `recordings_1/wrist` + brown box
+
+Baseline input: [trajectory_contact_adj_d30.0mm_translate.npz](outputs/recordings_1/wrist/trajectory_contact_adj_d30.0mm_translate.npz) (the static d=30 mm primary=left translate adjustment of the smoothed trajectory — preserves L's contact intent).
+
+R-only iteration, start-only shifts in y and z, both decaying linearly to demo by end of motion:
+
+| Phase | What happens | Why |
+|---|---|---|
+| K=1 | y_shift_start = -200 mm (R pushed far in -y), no z shift | Maximum lateral safety. R won't crush the box during slow_move to start pose. |
+| K=2..K=10 | y locked at -170 (no further y change), z safety decays per γ=0.85 (R progressively descends) | L is already at its contact pose; R needs to descend onto the box top. Locking y prevents R-y from drifting toward demo (which would put R 6 mm outside the -y face — too close to risk during iteration on z). |
+| K=11..  | y also decays per γ=0.85 (R approaches box from -y side as well) | After R is near box top (z safety ~15 mm), start tightening y to engage the box's -y face for full grip. |
+
+The z-safety budget is the wrist's height above the contact target: `safety_k = (R_demo_z − R_contact_target_z) × γ^(k-1)`, where contact target = `box_top_z + gripper_length = 0.272 m`. So `z_shift_k = 79 mm × (1 − γ^(k-1))`. Decays asymptotically: K=10 ≈ 18 mm, K=20 ≈ 3 mm.
+
+### Per-iteration runner
+
+For each iteration K, the workflow is three commands chained:
+
+```bash
+# 1. Generate the adjusted trajectory bundle
+/home/yunshuang/anaconda3/envs/depth_lerobot/bin/python contact_adjustment.py \
+    --smoothed outputs/recordings_1/wrist/trajectory_contact_adj_d30.0mm_translate.npz \
+    --shift-R-y-start-mm <Y_VAL> --lower-R-start-mm <Z_VAL> \
+    --tag K${K}_Ronly_dRyStart${Y_VAL}_dRzStart${Z_VAL}
+
+# 2. Re-solve IK in MuJoCo (gripper-tip-at-wrist via --gripper_offset_m 0.09 is essential)
+source /home/bruce/miniconda3/etc/profile.d/conda.sh && conda activate trossen_sim && \
+MUJOCO_GL=egl python replay_trossen_ik.py \
+    --in_npz outputs/recordings_1/wrist/trajectory_contact_adj_<tag>.npz \
+    --scene_xml /home/bruce/Aloha_real/trossen_arm_mujoco/trossen_arm_mujoco/assets/stationary_ai/scene_joint.xml \
+    --record_mp4 outputs/recordings_1/wrist/trossen_replay_contact_adj_<tag>.mp4 \
+    --position_only --warmup_seconds 2.0 --gripper_offset_m 0.09
+
+# 3. Real-arm replay with D455-low workspace cam recording (via the new --d455 flag in replay_real.py)
+source /home/yigit/miniconda3/etc/profile.d/conda.sh && conda activate lerobot && \
+python replay_real.py --max-step-delta 0.2 --d455 low
+```
+
+### Supporting infra added this session
+
+- [`replay_real.py`](replay_real.py): added `--d455 {high,low,both}` to register the workspace D455 cameras on-the-fly (their serials aren't in yigit's lerobot Stationary config). `--auto-skip-leading-invalid` flag uses `trajectory_smoothed.npz` masks to skip back-filled frames. `slow_move_to` rewritten to bypass `send_action`'s `max_relative_target` clamp by calling `arm.driver.set_all_positions` directly — without this, large slow-moves get clamped and the arm never reaches the target pose.
+- [`park_pose.py`](park_pose.py): moves both arms to the goal-capture park pose and holds indefinitely. Used during brown box recapture so the arms don't appear in the depth scene.
+- [`brown_box_pointcloud.py`](brown_box_pointcloud.py): added `--auto-click SERIAL,X,Y` and `--no-viewer` for headless re-extraction.
+
+### Notes from iteration
+
+- **Gripper offset is essential.** Running `replay_trossen_ik.py` *without* `--gripper_offset_m 0.09` makes the IK target link_6 (the wrist) at the trajectory point, but the gripper tip then projects 9 cm *forward* of that — meaning the tips end up ~6 cm closer to each other than the human's fingertips were, and a box that fit the human's hands no longer fits the robot's. The user's commit `b4c76cd` (gripper-tip-at-wrist via `tip_offset_local`) makes this a one-line fix.
+- **The `_start` shift formulation matters.** Constant `--lower-R-mm` shifts R uniformly across all 220 frames; R's end-of-motion pose ends up at a different absolute location. Visible as "the trajectory shrunk." The `_start` variants apply the shift only at the arm's first valid frame and decay it linearly to 0 by the last valid frame — R's end pose matches the demo exactly.
+- **The translate vs scale split.** Paper's scale mode (Eq. 11) shrinks the inter-arm gap uniformly across all frames. For our box-pivot demo, this can collapse the gap at the pivot apex (where L and R were already close in the demo) — visible as "grippers crash." Translate mode avoids this entirely.
+- **Z safety budget vs Y safety budget.** Z safety is well-defined (gripper tip height above box top). Y safety is geometry-dependent (depends on R's approach axis and gripper orientation under `--position_only`). When unlocking y for iteration, expect the iteration to be less predictable since gripper orientation is free.
