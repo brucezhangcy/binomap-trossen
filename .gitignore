@@ -1,0 +1,38 @@
+# Raw RGB-D recordings (PNG sequences, ~600 MB; archived as recordings.zip).
+# Leading slash anchors the pattern to the repo root so it does NOT match
+# outputs/recordings_1/ etc.
+/recordings/
+/recordings_1/
+/recordings.zip
+
+# Encoded source-video MP4s (derived from raw recordings)
+/videos/
+
+# External repos (have their own GitHub remotes; cloned for local use only)
+/trossen_arm_mujoco/
+/wilor_repo/
+
+# BiNoMaP paper PDF + Chinese translation (authors' copyright / not for public repo)
+BiNoMaP.pdf
+BiNoMaP_Chinese.md
+BiNoMaP_summary.md
+
+# Local handoff zips (regenerate from outputs/ as needed)
+trajectory_results.zip
+trajectory_animations.zip
+trossen_sim_results.zip
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Misc / scratch
+smoke_test_wilor.py
+clean_trajectory.py
+*.tmp
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
