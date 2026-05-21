@@ -3,10 +3,18 @@
 # outputs/recordings_1/ etc.
 /recordings/
 /recordings_1/
+/recordings_one_hand_fix/
+/recordings_one_hand_fix_7s/
 /recordings.zip
 
 # Encoded source-video MP4s (derived from raw recordings)
 /videos/
+
+# Local archive zips of raw data (multi-GB)
+/archives/
+
+# Scratch / debug overlays
+/_inspect/
 
 # External repos (have their own GitHub remotes; cloned for local use only)
 /trossen_arm_mujoco/

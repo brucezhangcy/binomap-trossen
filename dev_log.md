@@ -797,3 +797,135 @@ Validation: with current pipeline (no box in sim) this just visually separates t
 - `recordings_1/wrist`: position-only IK, default sigma_m=0.005. L 1.3 / R 1.6 mm mean. ✅ recommended.
 - `recordings/wrist`: position-only IK, sigma_m=0.008. L 2.3 / R 1.6 mm mean, brief L startup blip. Acceptable.
 - Both midpoint bundles: not re-replayed; midpoint inherently wobblier.
+
+## 2026-05-20/21 — GitHub push + IK refinements + new clip diagnosis
+
+### GitHub push
+
+- Initialized [/data/bruce/BiNoMaP](/data/bruce/BiNoMaP) as a git repo.
+- Pushed to https://github.com/brucezhangcy/binomap-trossen (renamed from a typo `bimomap-trossen`).
+- `.gitignore` excludes: raw RGB-D recordings, recordings.zip / recordings_one_hand_fix.zip, `trossen_arm_mujoco/` and `wilor_repo/` (external repos), the BiNoMaP paper PDF + Chinese translation, encoded `videos/` MP4s, `__pycache__/`, and the staging zips (`trajectory_results.zip`, `trajectory_animations.zip`).
+- Initial commit (52 files, 7.9 MB): all `.py` pipeline scripts, dev_log, README, and `outputs/` (4 bundles × {trajectory, smoothed, IK replay, plots}).
+- Pulled remote commit (`d4b0992`): mentor added `record_rgbd.py`, `replay_real.py`, `view_brown_box.py`.
+
+### New input clip: recordings_one_hand_fix (Bruce, 2026-05-21)
+
+- Unzipped (~2 GB extracted → 5806 PNG frames). Top-level `recordings/` inside the zip renamed to `recordings_one_hand_fix/` to avoid clash with the existing `recordings/`.
+- Moved both zip files into `archives/` to declutter the project root.
+- Encoded sibling MP4s in `videos/recordings_one_hand_fix_<serial>.mp4` (~15 MB each, 48 s, 30 fps).
+- Per-camera frame counts: L = 1453, R = 1445.
+
+### Gripper-tip-at-wrist IK fix (replay_trossen_ik.py)
+
+Mentor's directive: "position of hand wrist should be the tip of the gripper." Previous setup: wrist-trajectory → Trossen `link_6` target. But Trossen's gripper extends ~9 cm forward from `link_6`, so the GRIPPER TIP was landing 9 cm beyond the human wrist (a 35 cm box wouldn't fit between the tips).
+
+**v1 wrong fix (don't use):** pre-shift wrist target by `-9 cm × R_target[:,2]` before IK. Failed because in `--position_only` mode, the achieved `link_6` orientation isn't the trajectory's `R_target` orientation — so the offset direction in world frame was wrong → tracking went to hell.
+
+**v2 correct fix (current):** parameterize `ik_solve()` with `tip_offset_local` = a 3-vector in `link_6`'s LOCAL frame. The Jacobian is computed at `link_6_pos + R_link6 @ tip_offset_local`, and pos_err is `target − (that point)`. So IK directly solves "gripper tip at target" instead of "link_6 at target". For Trossen: `tip_offset_local = [0.09, 0, 0]` (9 cm along link_6 +x).
+
+Verification on `recordings_1/wrist`:
+- L tip mean: 0.3 mm, p95 0.6 mm, max 2.1 mm
+- R tip mean: 1.3 mm, p95 1.5 mm, max 66.7 mm (one outlier → see boundary-pin fix below)
+
+### First/last valid frame pin (after joint smoothing)
+
+Found a follow-on bug: joint-space Gaussian smoothing (default σ=2 frames) was distorting the FIRST and LAST valid frames per arm, pulling them toward neighbor frames that hold the boundary back-fill or move quickly afterward. For `recordings_1` R-arm this gave a 66 mm start-point error at the first valid R frame (47).
+
+Fix: capture each arm's first-valid and last-valid joint-target BEFORE smoothing, then restore them after. Result: start-point alignment now sub-mm on both arms.
+
+```
+L first valid frame 0: tip target = (-0.009, 0.167, 0.193) m,  sim tip = (-0.009, 0.167, 0.193) m,  err = 0.24 mm
+R first valid frame 47: tip target = (-0.043, -0.206, 0.351) m, sim tip = (-0.043, -0.206, 0.351) m, err = 0.14 mm
+```
+
+### `clean_trajectory.py` (utility)
+
+Standalone post-processor that (a) rejects YOLO-fallback frames (`side_detected != expected_side`) and (b) re-runs Stage 2a smoothing with a configurable noise budget. Tried it on `recordings/wrist` with `sigma_m=0.012` and aggressive fallback rejection — over-corrected (R-cam went from 105 raw valid → 26 raw, then 44/221 grid valid after fill_gaps, too sparse to be useful). Conclusion: per-arm σ would have been the better lever; leaving the script in the repo for future use but not running it in the default pipeline.
+
+### Recordings_one_hand_fix: trimmed to 7s + tried pipeline → real bug surfaced
+
+The full 48-s clip is mostly idle box (the active demonstration is only the first ~7 s). Trimmed to first 240 frames per camera (hardlinked, ~331 MB) → `recordings_one_hand_fix_7s/`.
+
+Ran the full pipeline. Results were structurally OK (extract → smooth → IK replay all ran, sim mp4 generated) but the trajectory was clearly wrong:
+- L cam: 240/240 valid (100% with 24 fill_gaps)
+- **R cam: only 39/240 valid (16%)** — and `side_detected: L=23, R=0, miss=217`. R cam never sees a hand YOLO labels "right" across all 240 frames.
+- Inter-wrist median in world frame: **70-73 mm**, vs 417 mm on `recordings_1` (a 5× drop).
+- Both L and R hand centroids cluster at +Y (left side of workspace) — both at z ≈ 0.42 m.
+
+### Diagnosis (long debug session, Bruce + me)
+
+Initial hypothesis sequence (most → least wrong):
+1. **"R cam doesn't see the right hand"** — wrong. Bruce clarified: he can clearly see the right hand bracing the bottom of the box in the R cam mp4.
+2. **"Stale extrinsics for this clip"** — wrong. Confirmed the `camera_extrinsics.json` is byte-identical across `recordings_1` and `recordings_one_hand_fix`, and Bruce confirmed the physical camera setup didn't change between sessions.
+3. **"Narrow-grip demo, so 10 cm wrist-to-wrist is correct"** — partially wrong. Inter-wrist of 10 cm is too tight for any plausible box grip, and the R hand z = 0.428 m doesn't match the visible hand at table level (z ≈ 0.02 m).
+4. **Actual cause** — see below.
+
+Wrote `debug_rcam.py` to inspect what WiLoR + YOLO actually do on a few R cam frames. Output:
+- Frames 30, 60, 90, 120, 180: **0 detections** (YOLO finds nothing despite a clearly visible right hand)
+- Frame 150: 1 detection — **YOLO drew its bbox in the middle of the box surface**, on what looks like the white shipping sticker. WiLoR ran on that bogus bbox and produced a "wrist" 2D pixel on the box itself. Depth at that pixel = 521 mm = box surface depth → deprojected wrist at z = 0.151 m (~mid-box height, NOT the real hand at z ≈ 0.02 m).
+
+So the real cause: **WiLoR-mini's bundled YOLO hand detector is failing on this clip.** Misses the actual hand in ~83 % of frames, generates false positives on the box's shipping sticker in some frames. The pipeline code is correct; the off-the-shelf detector just doesn't know what to do with a hand bracing the bottom of a cardboard box. Saved overlay images in `_inspect/dbg_R_f*.png` for reference.
+
+### Next step in progress: swap YOLO for MediaPipe Hands
+
+Three plausible fixes:
+- **(1) Different detector** — MediaPipe Hands or RTMPose-hand. Different training distribution; might catch the hand poses YOLO misses.
+- **(2) Manual bbox annotation** for 240 frames + feed to WiLoR's 3D-reconstruction step only (skip YOLO).
+- **(3) Temporal bbox propagation** — once a hand is detected, Kalman / optical-flow the bbox across nearby frames.
+
+Going with (1) — installing MediaPipe in the `wilor` env. Will run the same `debug_rcam.py` test on the same 6 frames to see if MediaPipe detects what YOLO missed. If yes, swap in MediaPipe + use depth+intrinsics deprojection (we don't need WiLoR's 3D mesh — MediaPipe already gives 21 3D landmarks per hand). If no, fall back to (2) or (3).
+
+---
+
+## 2026-05-21 — MediaPipe swap: fix lands cleanly
+
+### Detector swap → success
+
+Installed MediaPipe (`pip install mediapipe` → 0.10.35) in `wilor` env. The classic `mp.solutions.hands` API no longer ships with that version — switched to the new task API (`mediapipe.tasks.python.vision.HandLandmarker`) which needs an explicit model file. Downloaded `hand_landmarker.task` (7.8 MB) from Google's CDN.
+
+Tested first on the same 6 R-cam failure frames that broke WiLoR/YOLO (`debug_mediapipe.py`):
+
+| Frame | WiLoR/YOLO | MediaPipe |
+|---|---|---|
+| 30, 60, 90, 120, 180 | 0 detections | 4/5 detections ✓ |
+| 150 (false-positive on sticker) | bogus bbox on box | correct wrist ✓ |
+
+MediaPipe's keypoints land squarely on the actual hand (yellow dots in `_inspect/dbg_R_mp_f*.png`).
+
+### Drop-in replacement
+
+Wrote `extract_trajectory_mediapipe.py` — same CLI as `extract_trajectory.py`. Wraps the new HandLandmarker in a `MediaPipeRunner` class that returns detection dicts shaped exactly like WiLoR-mini's output (`hand_bbox`, `is_right`, `wilor_preds.pred_keypoints_2d/3d`), so all downstream helpers (`pick_detection`, `filter_outliers_by_neighbors`, `fill_gaps`, `align_bimanual`, `filter_bundle_outliers`, `save_outputs`, `plot_trajectory`) and Algorithm 1 are reused unchanged.
+
+### Full-pipeline run on `recordings_one_hand_fix_7s`
+
+```
+L cam valid (after fill): 240/240   (raw 234/240 → 6 filled)
+R cam valid (after fill): 196/240   (raw 184/240 → 27 filled, 15 outliers rejected)
+bimanual grid: 234   valid_L=231   valid_R=188
+```
+
+vs WiLoR (same clip): L 240/240, **R 39/240, inter-wrist 70 mm**.
+
+After Stage 2a smoothing + IK pass:
+- Inter-wrist median: **352 mm** (vs WiLoR's 70 mm) — now in the expected ~300 mm range for a two-handed box grip.
+- L mean position: (-0.006, 0.157, 0.410) m. R mean position: (-0.082, -0.111, 0.173) m.
+- L range covers ~150 mm in Y and 125 mm in Z (active lifting hand).
+- R range is narrow: 30 mm × 75 mm × 90 mm (consistent with "right hand barely moves, braces the box bottom").
+- IK pos err sub-mm (L mean 0.3 mm / max 1.0 mm, R mean 0.3 mm / max 1.0 mm). 0 IK failures, 0 per-frame fallbacks.
+
+### MediaPipe handedness quirk to remember
+
+R cam side-detected counts: `L=130, R=54, miss=56, fallback=130`. MediaPipe is mislabelling the (clearly visible) right hand as "Left" in ~70% of R-cam frames. Spot-checked overlays (`_inspect/verify_R_mp_f*.png`): the position is always on the right hand, the handedness label is just flipped. Spurious tiny detections at frame edges sometimes get the correct "Right" label, which is unhelpful. `pick_detection`'s area-fallback rescues this because it picks the largest detection when no handedness match exists — the real hand is always bigger than the spurious corner blob.
+
+If we later want to suppress those spurious detections explicitly, options are: (a) min-bbox-area filter in `MediaPipeRunner.__call__`, (b) ignore MediaPipe's handedness entirely on this clip and treat all detections as the expected side. Not blocking — leaving the area fallback as-is.
+
+### Files updated / created
+- `extract_trajectory_mediapipe.py` — new
+- `debug_mediapipe.py` — new (6-frame smoke test)
+- `_verify_mp_rcam.py` — new (overlay rendering for handedness sanity)
+- `hand_landmarker.task` — new (7.8 MB model)
+- `outputs/recordings_one_hand_fix_7s_mp/wrist/{trajectory*.npz, trajectory*.csv, trajectory*.png, replay_ik_pos.mp4, trossen_replay_ik_log.npz}`
+
+### Status
+
+Stage 1 trajectory extraction now works for both clips. `recordings_one_hand_fix_7s` produces a geometrically sensible bimanual trajectory (~35 cm wrist separation, sub-mm IK convergence on Trossen). The MediaPipe path will likely be the new default for any clip where the demonstrator's hands aren't in a "natural" pose (knuckles-down, palm-up bracing, partial occlusion).

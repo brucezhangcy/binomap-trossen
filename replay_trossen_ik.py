@@ -132,8 +132,16 @@ def get_arm_indices(model, side):
 def ik_solve(model, data, target_pos, target_quat, arm_info,
              use_orientation=True, max_iters=200,
              tol_pos=1e-3, tol_rot=0.02,
-             damping=0.05, step_clip=0.3):
+             damping=0.05, step_clip=0.3,
+             tip_offset_local=None):
     """Damped LS IK for one arm. Modifies data.qpos[q_idx] in place.
+
+    tip_offset_local (3,) — offset in link_6 LOCAL frame of the point that IK
+    should drive to target_pos. Default None = link_6 body origin (legacy).
+    Pass e.g. [0.09, 0, 0] to make IK solve "gripper tip at target" (Trossen
+    gripper extends ~9cm along link_6 local +x from link_6 origin).
+    This decouples the IK target from the link_6 body, so position-only IK
+    truly tracks the tip rather than link_6.
 
     Returns (pos_err [m], rot_err [rad], iters, converged_bool)."""
     q_idx, v_idx, _, ee_body_id, jnt_range = arm_info
@@ -143,6 +151,9 @@ def ik_solve(model, data, target_pos, target_quat, arm_info,
     mujoco.mju_quat2Mat(target_R_flat, target_quat)
     target_R = target_R_flat.reshape(3, 3)
 
+    if tip_offset_local is None:
+        tip_offset_local = np.zeros(3)
+
     pos_err_norm = np.inf
     rot_err_norm = np.inf
     for it in range(max_iters):
@@ -150,8 +161,11 @@ def ik_solve(model, data, target_pos, target_quat, arm_info,
         mujoco.mj_kinematics(model, data)
         mujoco.mj_comPos(model, data)
 
-        cur_pos = data.xpos[ee_body_id].copy()
-        cur_R = data.xmat[ee_body_id].reshape(3, 3).copy()
+        # Compute IK control point: link_6 body origin + R_link_6 @ tip_offset_local
+        link6_pos = data.xpos[ee_body_id]
+        link6_R = data.xmat[ee_body_id].reshape(3, 3)
+        cur_pos = (link6_pos + link6_R @ tip_offset_local).copy()
+        cur_R = link6_R.copy()
 
         pos_err = target_pos - cur_pos
         if use_orientation:
@@ -166,7 +180,7 @@ def ik_solve(model, data, target_pos, target_quat, arm_info,
         if pos_err_norm < tol_pos and (not use_orientation or rot_err_norm < tol_rot):
             return pos_err_norm, rot_err_norm, it + 1, True
 
-        # Jacobians at the current EE position
+        # Jacobian at the IK control point (not link_6 origin)
         jacp = np.zeros((3, model.nv))
         jacr = np.zeros((3, model.nv))
         mujoco.mj_jac(model, data, jacp, jacr, cur_pos, ee_body_id)
@@ -248,23 +262,18 @@ def main():
     p_R_t = p_R + offset[None, :]
 
     # Gripper-length compensation. Trossen ALOHA's gripper extends ~9 cm
-    # forward from link_6 (the wrist body we drive); the human hand extends
-    # ~6 cm from MANO wrist to fingertip-midpoint. Without compensation the
-    # Trossen gripper tips end up ~6 cm closer together than the human's were,
-    # so a box that fit the human's hands won't fit Trossen's. Per-frame push
-    # along the trajectory's approach axis (R column 2 = palm normal from
-    # Algorithm 1) restores the gripper-tip spacing.
+    # forward from link_6 along link_6 local +x. The trajectory describes
+    # where the human WRIST was; for the human, the gripper-contact point was
+    # ~6 cm forward from that wrist. To make the Trossen GRIPPER TIP track the
+    # human wrist (Bruce's directive), we pass tip_offset_local=[d, 0, 0] to
+    # the IK so it solves for "gripper tip at wrist target" instead of
+    # "link_6 at wrist target". d = +0.09 m for Trossen.
+    # This works correctly in position-only mode because the offset is in
+    # link_6 LOCAL coordinates (rotates with the joint chain), not in world.
+    tip_offset_local = np.array([args.gripper_offset_m, 0.0, 0.0])
     if args.gripper_offset_m != 0.0:
-        from extract_trajectory import rotmat_to_quat  # noqa
-        # R[:, 2] is the palm normal (v_z from Algorithm 1).
-        R_L = bundle["R_L"]
-        R_R = bundle["R_R"]
-        v_z_L = R_L[:, :, 2]  # (N, 3) palm normal per frame, world frame
-        v_z_R = R_R[:, :, 2]
-        p_L_t = p_L_t + args.gripper_offset_m * v_z_L
-        p_R_t = p_R_t + args.gripper_offset_m * v_z_R
-        print(f"gripper_offset_m = {args.gripper_offset_m:+.3f}m applied along per-frame approach axis "
-              f"(R[:,:,2]) for each arm")
+        print(f"gripper IK control point: link_6 + {args.gripper_offset_m:+.3f}m × link_6_local_+x "
+              f"(IK targets the gripper tip, not link_6)")
 
     q_L_mj = np.stack([quat_xyzw_to_wxyz(q_L[i]) for i in range(N)])
     q_R_mj = np.stack([quat_xyzw_to_wxyz(q_R[i]) for i in range(N)])
@@ -346,12 +355,14 @@ def main():
         if valid_L[k]:
             data.qpos[arm_L[0]] = last_qL  # warm-start from previous solution
             pe, re, it, conv = ik_solve(model, data, p_L_t[k], q_L_mj[k], arm_L,
-                                        use_orientation=not args.position_only)
+                                        use_orientation=not args.position_only,
+                                        tip_offset_local=tip_offset_local)
             if (not args.position_only) and (not conv or pe > POS_FALLBACK_THRESH_M):
                 # 6-DoF failed → retry position-only
                 data.qpos[arm_L[0]] = last_qL
                 pe, re, it, conv = ik_solve(model, data, p_L_t[k], q_L_mj[k], arm_L,
-                                            use_orientation=False)
+                                            use_orientation=False,
+                                            tip_offset_local=tip_offset_local)
                 n_fallback_L += 1
             joint_targets_L[k] = data.qpos[arm_L[0]]
             last_qL = joint_targets_L[k].copy()
@@ -365,11 +376,13 @@ def main():
         if valid_R[k]:
             data.qpos[arm_R[0]] = last_qR
             pe, re, it, conv = ik_solve(model, data, p_R_t[k], q_R_mj[k], arm_R,
-                                        use_orientation=not args.position_only)
+                                        use_orientation=not args.position_only,
+                                        tip_offset_local=tip_offset_local)
             if (not args.position_only) and (not conv or pe > POS_FALLBACK_THRESH_M):
                 data.qpos[arm_R[0]] = last_qR
                 pe, re, it, conv = ik_solve(model, data, p_R_t[k], q_R_mj[k], arm_R,
-                                            use_orientation=False)
+                                            use_orientation=False,
+                                            tip_offset_local=tip_offset_local)
                 n_fallback_R += 1
             joint_targets_R[k] = data.qpos[arm_R[0]]
             last_qR = joint_targets_R[k].copy()
@@ -388,18 +401,44 @@ def main():
     print(f"  per-frame position-only fallback (6-DoF→3-DoF when unreachable): "
           f"L={n_fallback_L}  R={n_fallback_R}")
 
+    # First/last valid frames per arm — used by both smoothing (pin boundaries)
+    # and the back-fill section below.
+    first_valid_L = int(np.where(valid_L)[0][0])
+    first_valid_R = int(np.where(valid_R)[0][0])
+    last_valid_L = int(np.where(valid_L)[0][-1])
+    last_valid_R = int(np.where(valid_R)[0][-1])
+
     # === Joint-space smoothing of IK output ===
     # Per-frame IK can "jump branches" when targets push it into different
     # solution basins (kinematic redundancy: same EE pose, multiple joint configs).
     # The result is visible joint-axis "twists" in the rendered video even when
     # EE tracking is fine. A small Gaussian on each joint independently removes
     # the twists; EE deviation from smoothing is sub-cm.
+    #
+    # First/last valid frames per arm are PINNED to their pre-smoothing IK value
+    # so the start-point alignment to the human wrist trajectory is exact. The
+    # smoothing kernel would otherwise drift these boundary frames toward
+    # adjacent IK solutions (worst case: ~70 mm tip error if the trajectory has
+    # fast motion right after the first valid frame, as in recordings_1 R-arm).
     if args.smooth_joints_sigma > 0:
         from scipy.ndimage import gaussian_filter1d
+        pinned_L = joint_targets_L[first_valid_L].copy()
+        pinned_R = joint_targets_R[first_valid_R].copy()
+        last_valid_L = int(np.where(valid_L)[0][-1])
+        last_valid_R = int(np.where(valid_R)[0][-1])
+        pinned_L_end = joint_targets_L[last_valid_L].copy()
+        pinned_R_end = joint_targets_R[last_valid_R].copy()
         for j in range(6):
             joint_targets_L[:, j] = gaussian_filter1d(joint_targets_L[:, j], sigma=args.smooth_joints_sigma)
             joint_targets_R[:, j] = gaussian_filter1d(joint_targets_R[:, j], sigma=args.smooth_joints_sigma)
+        # Restore pinned boundaries + back-fill before first-valid (since back-fill
+        # ran before smoothing, it was also distorted)
+        joint_targets_L[: first_valid_L + 1] = pinned_L
+        joint_targets_R[: first_valid_R + 1] = pinned_R
+        joint_targets_L[last_valid_L:] = pinned_L_end
+        joint_targets_R[last_valid_R:] = pinned_R_end
         print(f"  joint-space smoothing applied: gaussian σ={args.smooth_joints_sigma} frames")
+        print(f"    pinned first/last valid frames: L[{first_valid_L}, {last_valid_L}]  R[{first_valid_R}, {last_valid_R}]")
 
     # Back-fill pre-first-valid joint targets per arm: when an arm has no valid
     # detection for the first K frames (e.g. R-cam in recordings_1 misses
@@ -408,8 +447,7 @@ def main():
     # track that jump in 33 ms → big spike at the start of the replay.
     # Filling those leading frames with the first valid frame's config lets
     # the warmup lerp smoothly to that config and the replay start clean.
-    first_valid_L = int(np.where(valid_L)[0][0])
-    first_valid_R = int(np.where(valid_R)[0][0])
+    # (first_valid_L/R are already computed above for the joint smoothing pin.)
     if first_valid_L > 0:
         joint_targets_L[:first_valid_L] = joint_targets_L[first_valid_L]
     if first_valid_R > 0:
