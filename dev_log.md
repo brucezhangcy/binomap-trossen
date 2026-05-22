@@ -1057,3 +1057,116 @@ python replay_real.py --max-step-delta 0.2 --d455 low
 - **The `_start` shift formulation matters.** Constant `--lower-R-mm` shifts R uniformly across all 220 frames; R's end-of-motion pose ends up at a different absolute location. Visible as "the trajectory shrunk." The `_start` variants apply the shift only at the arm's first valid frame and decay it linearly to 0 by the last valid frame — R's end pose matches the demo exactly.
 - **The translate vs scale split.** Paper's scale mode (Eq. 11) shrinks the inter-arm gap uniformly across all frames. For our box-pivot demo, this can collapse the gap at the pivot apex (where L and R were already close in the demo) — visible as "grippers crash." Translate mode avoids this entirely.
 - **Z safety budget vs Y safety budget.** Z safety is well-defined (gripper tip height above box top). Y safety is geometry-dependent (depends on R's approach axis and gripper orientation under `--position_only`). When unlocking y for iteration, expect the iteration to be less predictable since gripper orientation is free.
+
+---
+
+## 2026-05-21 (later) — Status after the iteration sweep
+
+After the K1–K15 contact-adjustment sweep on `recordings_1`, the working point is:
+- **The `recordings_1` trajectory can flip the box in sim.** The Trossen arms now make contact, lift, and complete the pivot motion the demonstrator performed.
+- **But it still needs initial help placing the box.** The `recordings_1` clip *starts* with the box already mid-flip — the demonstrator's hands enter the frame already bracing the box from below. So when the sim replays from t=0, the box is sitting upright on the table while the grippers reach for where the hands were (already in the lifting pose). With no pre-contact setup, the box would just stay on the table while the arms reach over it.
+- Current workaround in sim: spawn the box at the orientation/position the demonstrator's hands are bracing it at on frame 0, rather than upright on the table. The Stage 2b contact-adjustment iteration handles the rest.
+
+Concretely this means the pipeline still needs a "pre-roll" or initial-box-placement step for any clip that doesn't start with the hands well clear of the box. Either:
+- record demos that always start with the hands away from the box and the box in its rest pose, or
+- add a synthesized lead-in segment that approaches the box from rest before the demonstrator's first valid frame.
+
+The MediaPipe clip `recordings_one_hand_fix_7s` may not have this issue — it starts with the right hand at a low resting position. Not yet tested end-to-end in sim with a box.
+
+---
+
+## 2026-05-21 — Paper-strict orientation pipeline (new replay path)
+
+Mentor task framing: existing replay uses `--position_only`. Paper §3.3 actually uses full 6-DoF — orientation matters. Build a NEW pipeline (don't touch existing working code) where:
+1. Orientation is tracked, not dropped.
+2. The mapping between gripper local axes and hand local axes is calibrated, not learned blindly (i.e., no `compute_orientation_remap` of mean orientation onto rest pose).
+3. The geometric constraint to enforce: **gripper-pointing direction = where the hand pushes the box = palm normal**.
+4. Goal: still flip the box, but with orientation.
+
+### Calibration of R_align (gripper-local → hand-local)
+
+Algorithm 1 builds `R_hand = [v_x | v_y | v_z]` columns, where v_z is the palm normal. Trossen ALOHA link_6 +x is the tool axis (gripper pointing). So the mapping is:
+
+```
+R_align = R_y(-90°) @ R_x(roll)   # roll is a free parameter (around the tool axis)
+```
+- R_y(-90°): maps gripper-local +x → hand-local +z (palm normal). This is the constraint.
+- R_x(roll): rotation around the tool axis — preserves the gripper-pointing constraint, but lets us pick the orientation around it (where the parallel-jaw finger plane lies).
+
+Tested rolls (0, 45, 90, 135, 180°): roll=90° gave the best R-arm IK convergence (105/139 → 27/139 failed frames, mean rotation error 38° → 7.3°). Roll=0/45/180 left R-arm grossly unreachable. **Picked roll=90°.** CLI form: `--align_euler_deg 90,-90,0`.
+
+Verified visually:
+1. World-frame 3D plot: hand v_z arrows (blue) and gripper-pointing arrows (black) overlay exactly across all sampled frames. Both R-arm and L-arm arrows point inward (toward each other / the box midpoint) — i.e., toward where the hand is pushing.
+   → `outputs/recordings_1/wrist/orient_calib_roll90.png`
+2. RGB overlay on the source video frames: the v_z arrow (re-projected into camera) lands inside the box from the wrist position. Confirmed on L-cam f80 where the L hand braces the box's right face — palm normal arrow points clearly into the box.
+   → `outputs/recordings_1/wrist/orient_rgb_overlay/verify_L_f080.png` and 7 other frames.
+
+### New scripts
+
+- `calibrate_gripper_align.py` — 3D world-frame plot of trajectory + RGB-coloured hand-frame arrows + black gripper-pointing arrow, parameterized by Euler-ZYX angles. Used to iterate the roll until the gripper-pointing axis overlays v_z and the resulting EE orientation is reachable for both arms.
+- `calibrate_orient_rgb_overlay.py` — projects the same arrows onto the source RGB image (with intrinsics rescaling for upscale) for direct ground-truth comparison against the demonstrator's hand.
+- `replay_trossen_paper.py` — strict-paper joint-space IK replay. Hard-coded R_align (no learned remap). Always tracks orientation. Has `--allow_pos_fallback` for the small set of frames where the human wrist twist exceeds Trossen's reachable orientation cone (paper-allows a graceful per-frame fallback to position-only on those exact frames; the rest of the trajectory keeps full 6-DoF).
+- `extract_trajectory_v1_backup.py` — verbatim snapshot of the pre-fix extraction script, so we can roll back if anything breaks.
+
+### Discovered Stage-1 bug: WiLoR handedness mislabeling causes 178° R-arm rotation cluster
+
+When running the new replay-paper pipeline I saw a "vibrate twisting" in the R-arm motion that wasn't present in `--position_only`. Diagnostic:
+1. Frame-to-frame angular delta on R was **17.6°/frame mean** (vs <1°/frame on L) with max **124°/frame**. Stage 2a's SLERP-between-anchors was producing 11.9°/frame for 15 consecutive frames in the [anchor_177 → anchor_192] segment — totaling a 178° rotation that the human wrist did NOT actually do.
+2. The R-arm rotation matrices form a **bimodal cluster**: mean deviation from the global mean orientation is **75.7° with p95=170°** (the cluster gap). L-arm has the same metric at 20.5° / 43.7° — well-behaved.
+3. Looking at `side_R_detected`, WiLoR-mini's bundled YOLO labels the right hand as "Left" in **50/103** valid R-cam frames on `recordings_1`. The runs of "L"-labeled and "R"-labeled frames alternate.
+
+Root cause traced into `wilor_mini/pipelines/wilor_hand_pose3d_estimation_pipeline.py`:
+- Line 108-122: when the detector returns is_right=0, the input image is X-flipped before pose regression.
+- Line 139: after regression, `pred_keypoints_3d[:, :, 0]` is negated to "unflip back" to original image coordinates.
+- Net effect: for an actually-right hand mislabeled as "Left", the resulting kp3d describes the right hand AS IF IT WERE A LEFT HAND in original image space. Algorithm 1's chirality sign-flip (`if side == "L": v_z = -v_z`) then operates on those mirrored keypoints, producing a rotation matrix in a basis 180° rotated from the correctly-labeled frames.
+
+The X-flip-then-undo isn't a simple basis rotation we can cleanly undo at our end (I tried — `kp3d[:, 0] = -kp3d[:, 0]` didn't fix it). So the fix is to **trust the camera's known hand assignment, not the detector**.
+
+### Fix in extract_trajectory.py
+
+[extract_trajectory.py:380-388]: when the per-frame `is_right` flag from WiLoR disagrees with the camera's `expected_side`, drop the frame entirely (treat as a missed detection). Position would still be recoverable, but orientation can't be safely reconciled with the other-labeled frames' basis.
+
+```python
+expected_is_right = 1 if expected_side == "R" else 0
+if side_int != expected_is_right:
+    n_side_mismatch += 1
+    if k % log_every == 0:
+        print(f"  [{k}/{N}] side mismatch (detected={'R' if side_int else 'L'} "
+              f"expected={expected_side}) → drop frame", flush=True)
+    continue
+```
+
+### Results on recordings_1
+
+| Metric | v1 (buggy) | v2 (fixed) |
+|---|---:|---:|
+| R-cam orient. dev from mean (mean / p95) | 75.7° / 170.3° | **17.1°** / 30.5° |
+| R-cam orient. frame-to-frame (mean / max) | 17.6° / 124° | **1.4°** / 6.5° |
+| R-arm IK pos err (mean / max) | sub-mm | sub-mm |
+| R-arm IK rot err (mean / max) | sub-deg | sub-deg |
+
+Trade-off: dropping the 78 mislabeled R-cam frames leaves only 79 valid_R bimanual grid samples (out of 220), vs 139 in v1. But the surviving samples form a single basis — orientation evolves smoothly.
+
+### Second wobble — gap interpolation
+
+Even with the basis bug fixed, a single ~30° R-wrist (j5) sudden rotation remained at frames 101-108. Cause: 43-frame R-arm gap between valid frame 61 and next valid frame 105. During the gap the joint targets were held at frame-61's config. Frame 105's IK then picked a j5 value ~100° away in the wrist-roll null-space (j5 is redundant relative to gripper-pointing direction, so the IK basin near the held config wasn't a unique solution). The joint Gaussian smoothing then ramped the discontinuity over ~5 frames → visible wrist twist.
+
+Fix in `replay_trossen_paper.py`: linearly interpolate joint targets across the gap between two valid IK solutions BEFORE Gaussian smoothing. Result: R j5 per-frame jump dropped **31.5° → 3.7°** (8.5× smaller). Overall R ||Δq|| max dropped 34° → 12.8° (the remaining 12.8° is the legitimate shoulder reach when the arm first engages at frame 47, not a wrist twist).
+
+### Tip-to-tip distance sanity check
+
+Source trajectory wrist-to-wrist on recordings_1 v2 (both arms valid): **mean=429mm, median=428mm, range 397-454mm**. Sim FK gripper-tip-to-gripper-tip = 427mm mean — matches IK target to sub-mm. (For comparison: `recordings_one_hand_fix_7s_mp` is mean 365mm / median 352mm — a different demo with a smaller box / closer-together grip.)
+
+### Files added/modified
+
+- modified: `extract_trajectory.py` (side-mismatch frame drop)
+- new: `extract_trajectory_v1_backup.py` (rollback snapshot, per user request)
+- new: `calibrate_gripper_align.py` (3D world-frame R_align calibration)
+- new: `calibrate_orient_rgb_overlay.py` (source-RGB v_z visualization)
+- new: `replay_trossen_paper.py` (strict-paper 6-DoF IK replay with hard-coded R_align)
+- outputs: `outputs/recordings_1_v2/wrist/{trajectory*.npz, trajectory*.csv, trajectory*.png, replay_paper_fixed.mp4, trossen_replay_paper_log.npz}`
+- kept (final calibration artifacts): `outputs/recordings_1/wrist/{orient_calib_roll90.png, orient_rgb_overlay/}`
+
+### Status
+
+New paper-strict pipeline produces orientation tracking that's smooth (sub-1°/frame source orientation jitter, IK sub-mm/sub-1° error, no visible wrist twist) and respects the gripper-points-where-palm-pushes constraint by construction. Box-flip verification still pending an appropriate box position in the scene XML — the default 25 mm cube at floor (z=0.0325 m) doesn't intersect the trajectory at z≈0.2 m.

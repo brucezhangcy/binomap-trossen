@@ -306,7 +306,6 @@ def process_camera(cam, expected_side, runner, position_source="wrist",
     n_no_det = 0
     n_no_depth = 0
     n_out_workspace = 0
-    n_side_mismatch = 0
     for k, (frame_idx, _ts_unix, t_dev_ms) in enumerate(cam["frames"]):
         ts_ms[k] = t_dev_ms
         rgb_path = cam["rgb_dir"] / f"{frame_idx:06d}.png"
@@ -362,29 +361,9 @@ def process_camera(cam, expected_side, runner, position_source="wrist",
                 print(f"  [{k}/{N}] out-of-workspace p_w={p_w}  bounds={workspace_bounds}", flush=True)
             continue
 
-        # === Algorithm 1 rotation, in camera frame ===
-        # FIX (2026-05-21): WiLoR-mini's hand-side detector mislabels right-as-left
-        # on ~half the R-cam frames in some clips (recordings_1: 50/103 valid
-        # R-cam frames). When mislabeled, WiLoR internally X-flips the input,
-        # runs MANO regression as if the hand were a left hand, then un-flips
-        # the output X-axis (see wilor_mini/pipelines/wilor_hand_pose3d_estimation_pipeline.py:139).
-        # The resulting kp3d for mislabeled frames sits in a DIFFERENT basis than
-        # the correctly-labeled frames — even though both pretend to describe
-        # the same physical hand. Mixing the two bases through Stage 2a's SLERP
-        # between anchors produces 178° spurious wrist twists.
-        # Policy: trust expected_side (the camera's dedicated hand), keep
-        # position from all frames, but drop ORIENTATION on frames where the
-        # detector disagrees — those frames will have valid position but the
-        # rotation matrix is left as zeros and ignored downstream.
-        expected_is_right = 1 if expected_side == "R" else 0
-        if side_int != expected_is_right:
-            n_side_mismatch += 1
-            if k % log_every == 0:
-                print(f"  [{k}/{N}] side mismatch (detected={'R' if side_int else 'L'} "
-                      f"expected={expected_side}) → drop frame", flush=True)
-            continue
-        R_cam = algorithm1_so3(kp3d, expected_side)
-        side_for_alg = expected_side  # for logging only
+        # Algorithm 1 rotation, in camera frame
+        side_for_alg = "R" if side_int == 1 else "L"
+        R_cam = algorithm1_so3(kp3d, side_for_alg)
 
         p_world[k] = p_w
         R_world[k] = R_c2w @ R_cam
@@ -396,9 +375,7 @@ def process_camera(cam, expected_side, runner, position_source="wrist",
             )
     dt = time.time() - t0
     print(
-        f"  cam done in {dt:.1f}s ({N/dt:.1f} fps). valid={valid.sum()}/{N}  "
-        f"no_det={n_no_det}  no_depth={n_no_depth}  out_workspace={n_out_workspace}  "
-        f"side_mismatch_dropped={n_side_mismatch}",
+        f"  cam done in {dt:.1f}s ({N/dt:.1f} fps). valid={valid.sum()}/{N}  no_det={n_no_det}  no_depth={n_no_depth}  out_workspace={n_out_workspace}",
         flush=True,
     )
     return {
