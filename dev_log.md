@@ -932,16 +932,18 @@ Stage 1 trajectory extraction now works for both clips. `recordings_one_hand_fix
 
 ## 2026-05-21 — Re-extracted brown box point cloud with arms parked
 
-Re-ran [brown_box_pointcloud.py](brown_box_pointcloud.py) while the bimanual arms were holding the goal-capture park pose (j1≈0.047, j2=0.700, j3=0.628, others 0 — both elbows swung forward, shoulders lifted, grippers above the workspace). The point was to capture a clean box-only cloud with zero arm geometry in the scene, since the previous May 20 capture was made with the arms in some neutral position.
+Re-ran the brown-box capture script (since superseded by [boxes/capture_box.py](boxes/capture_box.py) — see the May 22 consolidation entry below) while the bimanual arms were holding the goal-capture park pose (j1≈0.047, j2=0.700, j3=0.628, others 0 — both elbows swung forward, shoulders lifted, grippers above the workspace). The point was to capture a clean box-only cloud with zero arm geometry in the scene, since the previous May 20 capture was made with the arms in some neutral position.
 
 ### Tooling change
 
-Added `--auto-click SERIAL,X,Y` (repeatable) and `--no-viewer` CLI flags to `brown_box_pointcloud.py`. The original script required an interactive cv2 click per camera + an Open3D viewer at the end; both blocked headless / background runs. With the new flags the script is fully non-interactive when given clicks up-front. Reused the prior session's click coordinates:
+Added `--auto-click SERIAL,X,Y` (repeatable) and `--no-viewer` CLI flags so the original `brown_box_pointcloud.py` could run fully non-interactive when given clicks up-front. Reused the prior session's click coordinates:
 
 ```
 --auto-click 333422304645,359,263   # cam_low  (L)
 --auto-click 338122302972,361,226   # cam_high (R)
 ```
+
+(Both `--auto-click` and the script itself were superseded by the May 22 consolidation — see entry below. The headless flag has not been re-added to the new script; re-introduce if you need to script another parked-arm capture.)
 
 ### Before / after
 
@@ -973,16 +975,6 @@ Previous PLY preserved as `outputs/brown_box/brown_box.prev.ply` before overwrit
 - `outputs/brown_box/scene.ply` — overwritten with the 419,943-pt scene.
 - `outputs/brown_box/brown_box.prev.ply` — manual backup of the May 20 version.
 - `outputs/brown_box/visualize_compare.png` — new vs old side-by-side render.
-- `brown_box_pointcloud.py` — added `--auto-click` and `--no-viewer` flags (interactive default behaviour unchanged).
-
-### Headless invocation
-
-```bash
-/home/yunshuang/anaconda3/envs/depth_lerobot/bin/python brown_box_pointcloud.py \
-    --auto-click 333422304645,359,263 \
-    --auto-click 338122302972,361,226 \
-    --no-viewer
-```
 
 Hardware state during capture: both Trossen WX AI arms held in park pose by [park_pose.py](park_pose.py) (background process — position-mode actively locked, zero motion during the ~30 s SAM2 + capture pass).
 
@@ -1049,7 +1041,7 @@ python replay_real.py --max-step-delta 0.2 --d455 low
 
 - [`replay_real.py`](replay_real.py): added `--d455 {high,low,both}` to register the workspace D455 cameras on-the-fly (their serials aren't in yigit's lerobot Stationary config). `--auto-skip-leading-invalid` flag uses `trajectory_smoothed.npz` masks to skip back-filled frames. `slow_move_to` rewritten to bypass `send_action`'s `max_relative_target` clamp by calling `arm.driver.set_all_positions` directly — without this, large slow-moves get clamped and the arm never reaches the target pose.
 - [`park_pose.py`](park_pose.py): moves both arms to the goal-capture park pose and holds indefinitely. Used during brown box recapture so the arms don't appear in the depth scene.
-- [`brown_box_pointcloud.py`](brown_box_pointcloud.py): added `--auto-click SERIAL,X,Y` and `--no-viewer` for headless re-extraction.
+- brown-box capture script: added `--auto-click SERIAL,X,Y` and `--no-viewer` for headless re-extraction. (Now superseded by [`boxes/capture_box.py`](boxes/capture_box.py) — see May 22 consolidation.)
 
 ### Notes from iteration
 
@@ -1170,3 +1162,179 @@ Source trajectory wrist-to-wrist on recordings_1 v2 (both arms valid): **mean=42
 ### Status
 
 New paper-strict pipeline produces orientation tracking that's smooth (sub-1°/frame source orientation jitter, IK sub-mm/sub-1° error, no visible wrist twist) and respects the gripper-points-where-palm-pushes constraint by construction. Box-flip verification still pending an appropriate box position in the scene XML — the default 25 mm cube at floor (z=0.0325 m) doesn't intersect the trajectory at z≈0.2 m.
+
+---
+
+## 2026-05-22 — Object point-cloud capture: consolidated into one parameterized script
+
+The brown-box capture flow has grown — black box now, more boxes coming (cyan, blue, plastic, …). Collapsed two color-specific scripts + a color-specific viewer into one folder with two generic scripts.
+
+### Folder
+
+[`boxes/`](boxes/) — everything object-capture-related lives here, code and PLYs together:
+- [`capture_box.py`](boxes/capture_box.py) — single capture script, `--name <label>` → `<label>.ply` + `<label>_scene.ply` next to itself. SAM2 hiera-large with a per-camera click; no color logic. Works for any object on the table.
+- [`view_box.py`](boxes/view_box.py) — viewer; `--name <label>` resolves to `<label>.ply` in the same folder, or pass `--ply <path>` for anything else.
+- `brown_box.ply` — preserved from the May 21 parked-arm capture (35,580 pts).
+
+### Removed
+
+- `binomap/brown_box_pointcloud.py` (subsumed by `capture_box.py --name brown_box`)
+- `binomap/blackbox/blackbox_pointcloud.py` (subsumed by `--name black_box`; the `blackbox/` folder is gone)
+- `binomap/view_brown_box.py` (subsumed by `view_box.py --name brown_box`)
+- The `--auto-click SERIAL,X,Y` / `--no-viewer` headless flags from the old brown-box script were not carried forward. Re-add if you need to script another parked-arm recapture.
+
+### Workflow
+
+```
+# Put any object on the table. Then:
+python boxes/capture_box.py --name cyan_box
+# Click the object in each cv2 window. Outputs: boxes/cyan_box.ply + boxes/cyan_box_scene.ply.
+
+# Later:
+python boxes/view_box.py --name cyan_box
+```
+
+The `<name>_scene.ply` is the full unmasked merged scene for sanity-checking extrinsics; the `<name>.ply` is the masked + workspace-cropped + largest-DBSCAN-cluster cloud.
+
+### Rationale
+
+Earlier per-color scripts were 95% identical and would have spawned N copies as the object library grew. SAM2 doesn't care about color (it segments from the user's click), so a single `--name` parameter is sufficient. The May 21 brown-box capture is still the canonical brown reference; nothing about the empirical capture is changed by this reorg.
+
+## 2026-05-22 — recordings_2 box-flip: full pipeline succeeds after K=11
+
+New box-flip demo `recordings_2/` (binomap root, 6 s after warmup-barrier crop, 30 Hz on both D455 workspace cams). Captured with [record_rgbd.py](record_rgbd.py) — the warmup-barrier added yesterday ensures `--duration 8` produces a true 8 s of footage (timer only starts after both cameras complete RealSense auto-exposure warmup).
+
+### Pipeline used
+
+```
+extract_trajectory_mediapipe.py  →  trajectory.npz
+                                    (180/180 L valid, 176/180 R valid; bimanual grid 183 frames)
+smooth_trajectory.py             →  trajectory_smoothed.npz
+contact_adjustment.py            →  trajectory_contact_adj_K{k}_*.npz  (R-only start-shift, γ=0.85)
+replay_trossen_ik.py --rot-weight 0.2  →  trossen_replay_ik_log.npz   (soft 6-DoF, see below)
+replay_real.py --max-step-delta 0.2 --d455 low  →  hardware run
+```
+
+### New: soft 6-DoF IK (`--rot-weight` flag in `replay_trossen_ik.py`)
+
+`--rot-weight W` (default 1.0 = paper-strict) scales rotation rows of the IK Jacobian and the rotation error vector by W. Lets IK preserve sub-mm position tracking even when the demo's palm orientation isn't fully reachable by Trossen's kinematic chain.
+
+On recordings_2, full 6-DoF (W=1.0) collapsed the R-arm to a 259 mm position offset because the demo's R palm orientation at several frames requires joint configs Trossen can't reach. W=0.2 converges to L pos err mean 0.50 mm / max 0.99 mm; R pos err mean 0.37 mm / max 0.87 mm; L rot err max 1.1°; R rot err max 0.4°. Treats orientation as preference instead of hard constraint — IK finds joint configs that satisfy position first, then picks among them the one closest to the requested orientation.
+
+Practical reason: the paper assumes the demonstrator was thinking like a robot (always reachable). Real hand demos need slack on at least one axis. Soft DoF is the dial; W=0.2 was the sweet spot for this trajectory.
+
+**How it works.** Damped LS solves `dq = Jᵀ(JJᵀ+λ²I)⁻¹ err` where `J = [J_pos; W·J_rot]` and `err = [pos_err; W·rot_err]`. The cost minimized becomes `‖pos_err‖² + W² ‖rot_err‖²` — so W² is just the relative weight of rotation vs position in the IK objective.
+
+**Why it works geometrically.** A 6-DoF target rotation has 3 DoF: (a) palm-normal direction (2 DoF), (b) gripper roll around it (1 DoF). For a sandwich grip, roll doesn't matter much — the box doesn't care which way the wrist is twisted around the approach axis. Strict 6-DoF (W=1) treats roll as important as palm direction, so when reachability forces a compromise, the optimizer "splits the difference" and gives up position AND rotation. Soft DoF (W<1) tilts the cost so the compromise lands on roll (low cost when wrong) rather than position (high cost when wrong) — typically still satisfies palm direction within 1-2° as a side effect, because Trossen has effectively 1 DoF of redundancy.
+
+**Picking W:** 0=position-only · 0.2=our default for real hand demos · 0.5=tighter rotation if reachability allows · 1.0=paper-strict (use only if demo was Trossen-aware).
+
+### New: dynamic HOME pose in `replay_real.py`
+
+Previous `HOME_POSE_L = [0, 0.2618, 0.2618, 0, 0, 2.87, 0]` (set yesterday for recordings_1_v2's L wrist yaw) triggered `FIRST_STEP_ABORT_RAD = 2.5` when running recordings_2 (whose L j5 ≈ 0). Fixed by deriving HOME from the IK log's first commanded pose at runtime when `--auto-skip-leading-invalid` is on — works for any trajectory, eliminates per-trajectory editing of the constant.
+
+Side effect: also eliminates the start-frame "shake" — the back-fill plateau (frames 0..t_R_first−1) is skipped by `--auto-skip-leading-invalid`, so the first streamed frame is the first real IK solution. No joint jump at stream start.
+
+### Iteration schedule (R-only, start-shift, γ=0.85)
+
+Same shape as recordings_1's: shift R outward at start, decay linearly to 0 by trajectory end (preserves the demo's end pose). Starting wide for collision safety:
+
+| K | R y shift (mm) | R z lower (mm) | notes |
+|---|---|---|---|
+| 1 | −150 (safe wide) | 0 | start of iteration |
+| 2-10 | −128, −108, −92, −78, −66, −56, −48, −41, −35 | 0 | y γ-decay only |
+| **11** | **−30** | **30** | **z unlocked; box flips on real hardware** |
+
+### Result: box flips reliably at K=11
+
+Running `trajectory_contact_adj_K11_Ronly_dRyStart-30_dRzStart-30.npz` on the real Trossen ALOHA arms, **the box reliably tends to flip**. The combination of:
+
+- y safety tightened from 150 mm down to 30 mm over K=1..10 (γ-decay)
+- z safety opened at K=11 (R wrist drops 215 mm → 185 mm at start, gripper tip at box top z=182 mm)
+- Soft 6-DoF IK preserving rotation tracking while never failing position
+
+…brings R's gripper into reliable contact with the box's −y face during the grip phase, while the L hand follows the demo trajectory unchanged. End pose: L and R end ~31 cm apart (intrinsic to demo — demonstrator's hands had come back together as the box settled); replay passes safely through this because the gripper tips meet the box, not each other.
+
+### Notes / caveats
+
+- Geometric sanity checks on the raw trajectory failed (tip-to-tip < 350 mm at start, L.z≠R.z, R wrist above box top, end pose not stacked) — but the trajectory positions match what the demonstrator actually did, not what an idealized bimanual sandwich grip looks like. Iteration's job isn't to fix the positions; it's to bring the gripper to contact given those positions. K=11 achieves this.
+- Squeeze warning frames (tip-to-tip < box width 372 mm at frames 150-182) are intrinsic to the demo. Robot replay passes through safely because gripper tips meet the box, not each other.
+- MediaPipe pipeline ran on this host (coldbrew) for the first time. Required `pip install mediapipe` into the `trossen_sim` env + a 1-line lazy-import patch in `extract_trajectory.py` (moved `import torch` + `from wilor_mini import ...` into `WilorRunner.__init__`) so the MediaPipe variant can `from extract_trajectory import ...` without WiLoR/torch installed.
+- Soft DoF + dynamic HOME together make recordings_1_v2 and recordings_2 both replayable from the same `replay_real.py` without per-trajectory editing.
+
+---
+
+## 2026-05-22 (later) — Box-aware replay: SAM2-based Δxy substitute for paper's VLM
+
+BiNoMaP §3.3 sketches a VLM that estimates (Δx, Δy) between the demo's object pose and the new scene's object pose, then offsets the bimanual trajectory by that Δ. We don't run a VLM — we already have [`boxes/capture_box.py`](boxes/capture_box.py) (SAM2 + RGBD fusion) producing world-frame box point clouds. This entry documents the end-to-end box-aware replay pipeline built on top of that.
+
+### Convention: box poses live next to the trajectory
+
+For any trajectory bundle `<dir>/foo.npz`, both the success-reference and current PLYs live in `<dir>/box_poses/`. The pipeline derives this automatically — no per-recording hardcoding. For recordings_2:
+
+```
+outputs/recordings_2/wrist/box_poses/
+├── success_K11_brown.ply        (locked once, after the K=11 hardware success)
+├── success_K11_brown_scene.ply
+├── current.ply                  (overwritten before every replay)
+└── current_scene.ply
+```
+
+[`boxes/capture_box.py`](boxes/capture_box.py) takes `--out-dir` (default: legacy `binomap/boxes/` for back-compat). [`record_box_pose.py`](record_box_pose.py)'s `--out-dir` now defaults to the same directory as the input PLY (so JSON metadata, when generated, lands next to its source).
+
+### Pipeline orchestrator: `box_align_pipeline.py`
+
+One command does: capture current → compute Δ → translate bundle → re-run sim IK → print hardware command. Defaults derived from `--trajectory`:
+
+```bash
+/home/yunshuang/anaconda3/envs/depth_lerobot/bin/python box_align_pipeline.py \
+    --success-ply outputs/recordings_2/wrist/box_poses/success_K11_brown.ply \
+    --trajectory  outputs/recordings_2/wrist/trajectory_contact_adj_K11_Ronly_dRyStart-20_dRzStart-30.npz
+```
+
+Add `--current-ply <path> --skip-capture` to reuse an existing current PLY (skip the interactive SAM2 click). Add `--apply-dz` to keep the z component of Δ (default zeroes it — table is fixed).
+
+Outputs into the trajectory dir:
+- `<bundle>_box_aligned.npz` — Δ-translated bundle, preserves `p_L_pre_align`/`p_R_pre_align` for diff
+- `<bundle>_box_aligned_iklog.npz` — sim IK joints for the translated bundle
+- `replay_<bundle>_box_aligned.mp4` — sim render
+
+### Bug fixed: `replay_trossen_ik.py`'s frame_alignment was silently canceling Δ
+
+`compute_frame_alignment()` recomputes a re-centering offset on every IK run from `mean(p_L, p_R)` and snaps that midpoint to `TROSSEN_WORKSPACE_CENTER`. For any pure-translation augmentation Δ to the bundle, the mean shifts by Δ, the new offset is `(old_offset − Δ)`, and IK sees identical targets. Joint trajectory output before/after box-align was **byte-identical** despite `box_align_delta_xyz_m` being correctly stored.
+
+Verified on recordings_2 K=11: |Δ|=57 mm, target_L/R differed by 57 mm, but `joint_L`/`joint_R` differences were exactly 0. After fix: max joint diff up to 76° per joint (R), IK pos err stays <1 mm.
+
+**Fix** ([`replay_trossen_ik.py:268-282`](replay_trossen_ik.py)): when the bundle has a `p_L_pre_align` marker key, compute the alignment offset from the PRE-align coordinates so the box-align Δ survives into joint space.
+
+### Bug fixed: pipeline was clobbering the un-aligned IK log mid-run
+
+`replay_trossen_ik.py` writes to `<in_npz_parent>/trossen_replay_ik_log.npz` by default. The old pipeline wrote-then-renamed, which destroyed the existing default-named log (the user's un-aligned K=11 baseline) before the rename happened.
+
+**Fix:** added `--out-log <path>` to [`replay_trossen_ik.py`](replay_trossen_ik.py); [`box_align_pipeline.py`](box_align_pipeline.py) now passes the box-aligned name directly so the baseline log is never opened for writing. Hardware replay can fall back to `trossen_replay_ik_log.npz` (un-aligned K=11) at any time without rebuilding it.
+
+### Tightened K=11: R-y-start −30 → −20 mm (10 mm closer to box's −y face)
+
+Box-align translates without changing inter-arm geometry, so once the demo is placed correctly the only remaining knob is the contact-adjustment safety budget. Brought R one notch tighter:
+
+- Old K=11 bundle: `trajectory_contact_adj_K11_Ronly_dRyStart-30_dRzStart-30.npz` (now deleted)
+- New K=11 bundle: `trajectory_contact_adj_K11_Ronly_dRyStart-20_dRzStart-30.npz`
+
+Generated from `trajectory_smoothed.npz` with `contact_adjustment.py --shift-R-y-start-mm -20 --lower-R-start-mm 30`. Inter-arm 3D distance is essentially unchanged (min 314 mm both old and new); R min wrist z still 185.3 mm. K=11 in the iteration table now reads −20/−30 instead of −30/−30.
+
+### Hardware command (post-pipeline)
+
+```bash
+source /home/yigit/miniconda3/etc/profile.d/conda.sh && conda activate lerobot && \
+python replay_real.py \
+    --log outputs/recordings_2/wrist/trajectory_contact_adj_K11_Ronly_dRyStart-20_dRzStart-30_box_aligned_iklog.npz \
+    --max-step-delta 0.2 --d455 low
+```
+
+Drop `--d455 low` if you don't want the workspace-cam recording.
+
+### Notes
+
+- The "delete original IK log on diagnostic" failure mode happened twice during dev — once because the pipeline overwrote, and once because a diagnostic `replay_trossen_ik.py` invocation wrote the default-named log. The `--out-log` flag closes the pipeline path; for ad-hoc diagnostics, copy the log to a `_backup.npz` first.
+- Hardware replay still expects `--max-step-delta 0.2`. The box-align Δ (~5 cm) shows up as a few-cm offset of the entire joint trajectory, not as a single-frame jump, so the step-delta limit doesn't gate it.
+- Δz is zeroed by default (`--apply-dz` to keep). Rationale: the table is fixed in our setup, so any z component of the box AABB delta is point-cloud noise rather than real motion. Empirically Δz observed at <5 mm so far.

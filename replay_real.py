@@ -51,9 +51,17 @@ from lerobot.common.robot_devices.robots.utils import make_robot_from_config
 
 DEFAULT_LOG = pathlib.Path(__file__).parent / "outputs" / "recordings_1" / "wrist" / "trossen_replay_ik_log.npz"
 
-# Per-arm 7-DoF home (6 joints + gripper). Matches the lab's standard home in
-# move_robot.py / replay_state.py — compact pose that keeps arms inside camera FoV.
-HOME_POSE_PER_ARM = [0.0, 0.2618, 0.2618, 0.0, 0.0, 0.0, 0.0]
+# Per-arm 7-DoF home (6 joints + gripper). Matches the lab's standard compact
+# home from move_robot.py / replay_state.py for most trajectories. For the
+# paper-strict orientation replay (replay_trossen_paper.py), the L wrist yaw
+# (j5) lives near +π throughout — homing L's j5 to 0 would trigger the
+# FIRST_STEP_ABORT_RAD gate. So L's HOME is pre-aligned to the trajectory's
+# typical j5 ≈ 2.87 rad. R's wrist yaw stays near 0 even in the paper replay,
+# so R's HOME is unchanged. Edit per-arm here when a future trajectory has a
+# different starting wrist orientation.
+HOME_POSE_L = [0.0, 0.2618, 0.2618, 0.0, 0.0, 2.87, 0.0]
+HOME_POSE_R = [0.0, 0.2618, 0.2618, 0.0, 0.0, 0.0,  0.0]
+HOME_POSE_PER_ARM = HOME_POSE_L  # kept for callers that expect the old name
 
 # Per-joint Trossen WX AI hardware limits (rad), per arm. Same numbers used by
 # inference_dp3.py and replay_state.py. We clamp every commanded pose to these
@@ -354,7 +362,23 @@ def main():
                 f"action dim {actions.shape[-1]} != follower DOF {n_arms * 7}; "
                 f"this script assumes a 2-arm Trossen stationary setup.")
 
-        home = clamp_to_hw_limits(torch.tensor(HOME_POSE_PER_ARM * n_arms, dtype=torch.float32))
+        # HOME = the trajectory's first commanded pose (= actions[0] after
+        # auto-skip). This makes the slow_move HOME phase end exactly where
+        # the streaming starts, so:
+        #   - the safety abort check sees |Δ|=0 (no abort, regardless of trajectory)
+        #   - no back-fill plateau is sent (first streamed frame is the first real
+        #     IK solution, so no joint jump = no start shake)
+        # Per-trajectory HOME_POSE_L/_R constants are now unused for the slow_move
+        # but kept for documentation / fallback if --auto-skip-leading-invalid is off.
+        if args.skip_leading_invalid:
+            home = clamp_to_hw_limits(actions[0].clone())
+            print(f"HOME = first commanded pose (frame {start}): "
+                  f"L_j5={float(home[5]):+.3f}rad  R_j5={float(home[12]):+.3f}rad")
+        elif n_arms == 2:
+            home = clamp_to_hw_limits(torch.tensor(HOME_POSE_L + HOME_POSE_R, dtype=torch.float32))
+        else:
+            # Solo / mobile / other configs — fall back to the shared per-arm pose.
+            home = clamp_to_hw_limits(torch.tensor(HOME_POSE_PER_ARM * n_arms, dtype=torch.float32))
         print(f"Slow move HOME (move_time={args.home_move_time_s}s, settle={args.home_settle_s}s).")
         slow_move_to(robot, home, args.home_move_time_s, args.home_settle_s)
 

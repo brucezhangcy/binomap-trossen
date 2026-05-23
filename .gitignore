@@ -48,3 +48,18 @@ clean_trajectory.py
 
 # Local handoff: 1.9 GB archive of raw recordings, too big for github
 recordings_one_hand_fix.zip
+
+# Session-local raw RGBD captures + handoff zips (not for upstream)
+/recording_rotation/
+/recording_rotation.zip
+/recordings_2_inspect.png
+/outputs/recordings_2.zip
+
+# Hardware-run transcript dirs (each replay_real.py run produces one)
+/outputs/recordings_*/wrist/real_run_*/
+/outputs/recordings_*/midpoint/real_run_*/
+
+# Legacy box-capture PLYs in boxes/ root.
+# New captures live under outputs/<recording>/wrist/box_poses/ per the
+# box-poses-co-located-with-trajectory convention (see dev_log 2026-05-22).
+/boxes/*.ply

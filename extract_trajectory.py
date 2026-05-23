@@ -40,15 +40,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import (
-    WiLorHandPose3dEstimationPipeline,
-)
+# torch + wilor_mini are lazy-imported inside WilorRunner.__init__ so the
+# MediaPipe variant (extract_trajectory_mediapipe.py) can `from extract_trajectory
+# import ...` on hosts that don't have torch / wilor_mini installed.
 
 # ---------------- MANO/OpenPose joint indices (verified in wilor/models/mano_wrapper.py) ----------------
 IDX_WRIST = 0
@@ -240,6 +239,12 @@ def in_workspace(p_world, bounds):
 # ---------------- WiLoR wrapper ----------------
 class WilorRunner:
     def __init__(self, device="cuda:0"):
+        # Lazy imports — top-level removed so the MediaPipe variant can run
+        # on hosts without torch/wilor_mini.
+        import torch
+        from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import (
+            WiLorHandPose3dEstimationPipeline,
+        )
         self.device = torch.device(device)
         self.pipe = WiLorHandPose3dEstimationPipeline(device=self.device, dtype=torch.float32)
 

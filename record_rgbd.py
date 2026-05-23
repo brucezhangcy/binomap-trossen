@@ -129,6 +129,7 @@ def _record_one(
     fps: int,
     out_root: Path,
     max_frames: int | None,
+    warmup_barrier: threading.Barrier | None = None,
 ):
     cam_dir = out_root / serial
     rgb_dir = cam_dir / "rgb"
@@ -159,6 +160,15 @@ def _record_one(
                 return
             pipeline.wait_for_frames()
         print(f"[{serial} ({arm})] warmup done, recording @ {fps} Hz")
+
+        # Synchronize with other cameras + main: wait until ALL cameras have
+        # finished warmup before any of them starts writing frames. Main is
+        # also at the barrier; it starts the --duration timer right after.
+        if warmup_barrier is not None:
+            try:
+                warmup_barrier.wait(timeout=30.0)
+            except threading.BrokenBarrierError:
+                print(f"[{serial}] warmup barrier broken; proceeding anyway")
 
         t_start = time.time()
         while not _stop.is_set():
@@ -236,6 +246,13 @@ def main():
         action="store_true",
         help="Skip the robot-arm parking step (use if the robot is off).",
     )
+    parser.add_argument(
+        "--countdown",
+        type=int,
+        default=3,
+        help="Seconds of '3..2..1..GO' countdown after parking, before recording "
+             "threads start. Gives you time to get into position. Set to 0 to skip.",
+    )
     args = parser.parse_args()
 
     cams = _load_camera_specs(args.extrinsics)
@@ -262,17 +279,36 @@ def main():
     else:
         print("[main] --no-park set; skipping arm parking.")
 
+    if args.countdown > 0:
+        print(f"[countdown] starting recording in {args.countdown} s — get ready!")
+        for s in range(args.countdown, 0, -1):
+            print(f"  {s}...", flush=True)
+            time.sleep(1.0)
+        print(f"  GO — recording {args.duration if args.duration else 'until Ctrl-C'}.\n", flush=True)
+
     try:
+        # +1 for main; threads wait at this barrier after warmup completes.
+        warmup_barrier = threading.Barrier(len(cams) + 1)
         threads = []
         for serial, arm, w, h in cams:
             t = threading.Thread(
                 target=_record_one,
-                args=(serial, arm, w, h, args.fps, out_root, args.max_frames),
+                args=(serial, arm, w, h, args.fps, out_root, args.max_frames,
+                      warmup_barrier),
                 name=f"rec-{serial}",
                 daemon=True,
             )
             t.start()
             threads.append(t)
+
+        # Wait for ALL cameras to finish warmup before starting the duration
+        # timer — RealSense auto-exposure settling takes ~2-3 s, and prior to
+        # this barrier the timer would eat into the requested recording time.
+        try:
+            warmup_barrier.wait(timeout=30.0)
+            print(f"[main] all cameras warmed up; starting --duration timer.")
+        except threading.BrokenBarrierError:
+            print("[main] warmup barrier broken; starting timer anyway")
 
         if args.duration is not None:
             deadline = time.time() + args.duration

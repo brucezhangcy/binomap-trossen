@@ -130,7 +130,7 @@ def get_arm_indices(model, side):
 
 
 def ik_solve(model, data, target_pos, target_quat, arm_info,
-             use_orientation=True, max_iters=200,
+             use_orientation=True, rot_weight=1.0, max_iters=200,
              tol_pos=1e-3, tol_rot=0.02,
              damping=0.05, step_clip=0.3,
              tip_offset_local=None):
@@ -186,8 +186,14 @@ def ik_solve(model, data, target_pos, target_quat, arm_info,
         mujoco.mj_jac(model, data, jacp, jacr, cur_pos, ee_body_id)
 
         if use_orientation:
-            J = np.vstack([jacp[:, v_idx], jacr[:, v_idx]])  # (6, 6)
-            err = np.concatenate([pos_err, rot_err])
+            # Weighted 6-DoF: scale rotation rows of the Jacobian + rotation
+            # error by rot_weight. rot_weight=1.0 → paper-strict full 6-DoF.
+            # rot_weight<1.0 → soft rotation, IK still prefers matching the
+            # target orientation but won't sacrifice position to do so. Useful
+            # when the demo's palm orientation isn't fully reachable but you
+            # still want the gripper to roughly track palm direction.
+            J = np.vstack([jacp[:, v_idx], rot_weight * jacr[:, v_idx]])  # (6, 6)
+            err = np.concatenate([pos_err, rot_weight * rot_err])
             n = 6
         else:
             J = jacp[:, v_idx]  # (3, 6)
@@ -218,6 +224,10 @@ def main():
     ap.add_argument("--record_mp4", type=str, default=None)
     ap.add_argument("--mp4_fps", type=float, default=30.0)
     ap.add_argument("--our_table_z", type=float, default=0.02)
+    ap.add_argument("--rot-weight", type=float, default=1.0,
+                    help="Rotation tracking weight (0=ignore rot, 1=paper-strict 6-DoF). "
+                         "Use 0.1-0.3 to softly track palm direction without sacrificing "
+                         "position when the demo orientation isn't fully reachable.")
     ap.add_argument("--position_only", action="store_true",
                     help="Solve IK for position only (more permissive, ignores rotation)")
     ap.add_argument("--orientation_remap", action="store_true", default=True,
@@ -239,6 +249,11 @@ def main():
     ap.add_argument("--camera", default="cam_high",
                     help="MuJoCo camera name for offscreen rendering")
     ap.add_argument("--warmup_seconds", type=float, default=1.0)
+    ap.add_argument("--out-log", type=str, default=None,
+                    help="Path for the IK log npz. Default: "
+                         "<in_npz_parent>/trossen_replay_ik_log.npz "
+                         "(callers — e.g. box_align_pipeline.py — that don't want to "
+                         "clobber the existing default-named log should pass this).")
     args = ap.parse_args()
 
     bundle = np.load(args.in_npz)
@@ -255,8 +270,21 @@ def main():
     print(f"input: {args.in_npz}  N={N}  valid_L={int(valid_L.sum())}  valid_R={int(valid_R.sum())}")
     print(f"orientation: {'IGNORED' if args.position_only else 'tracked'}")
 
-    # Frame alignment (translate-only)
-    offset, ours_mid, target = compute_frame_alignment(p_L, p_R, valid_L, valid_R, args.our_table_z)
+    # Frame alignment (translate-only). If the bundle was box-aligned (Δxy
+    # translation by box_align_trajectory.py), compute the alignment offset
+    # from the PRE-align coordinates so the box-align Δ is preserved. Using
+    # the post-align p_L/p_R here would re-center the trajectory and cancel
+    # Δ exactly (mean(p+Δ) − Δ = mean(p)), making box-align a silent no-op.
+    if "p_L_pre_align" in bundle and "p_R_pre_align" in bundle:
+        p_L_for_align = bundle["p_L_pre_align"]
+        p_R_for_align = bundle["p_R_pre_align"]
+        print(f"box-aligned bundle: computing frame_alignment from PRE-align coords "
+              f"(preserves Δ={(bundle['box_align_delta_xyz_m']*1000).round(2).tolist()} mm)")
+    else:
+        p_L_for_align = p_L
+        p_R_for_align = p_R
+    offset, ours_mid, target = compute_frame_alignment(
+        p_L_for_align, p_R_for_align, valid_L, valid_R, args.our_table_z)
     print(f"offset = {offset.round(3)}  (ours_mid={ours_mid.round(3)} → trossen_target={target.round(3)})")
     p_L_t = p_L + offset[None, :]
     p_R_t = p_R + offset[None, :]
@@ -356,6 +384,7 @@ def main():
             data.qpos[arm_L[0]] = last_qL  # warm-start from previous solution
             pe, re, it, conv = ik_solve(model, data, p_L_t[k], q_L_mj[k], arm_L,
                                         use_orientation=not args.position_only,
+                                        rot_weight=args.rot_weight,
                                         tip_offset_local=tip_offset_local)
             if (not args.position_only) and (not conv or pe > POS_FALLBACK_THRESH_M):
                 # 6-DoF failed → retry position-only
@@ -377,6 +406,7 @@ def main():
             data.qpos[arm_R[0]] = last_qR
             pe, re, it, conv = ik_solve(model, data, p_R_t[k], q_R_mj[k], arm_R,
                                         use_orientation=not args.position_only,
+                                        rot_weight=args.rot_weight,
                                         tip_offset_local=tip_offset_local)
             if (not args.position_only) and (not conv or pe > POS_FALLBACK_THRESH_M):
                 data.qpos[arm_R[0]] = last_qR
@@ -535,7 +565,8 @@ def main():
           f"p95={np.percentile(err_R[valid_R], 95)*1000:.1f}mm  "
           f"max={err_R[valid_R].max()*1000:.1f}mm")
 
-    log_path = Path(args.in_npz).parent / "trossen_replay_ik_log.npz"
+    log_path = (Path(args.out_log) if args.out_log is not None
+                else Path(args.in_npz).parent / "trossen_replay_ik_log.npz")
     np.savez(log_path,
              target_L=p_L_t, target_R=p_R_t,
              actual_L=actual_pos_L, actual_R=actual_pos_R,
