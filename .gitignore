@@ -59,7 +59,6 @@ recordings_one_hand_fix.zip
 /outputs/recordings_*/wrist/real_run_*/
 /outputs/recordings_*/midpoint/real_run_*/
 
-# Legacy box-capture PLYs in boxes/ root.
 # New captures live under outputs/<recording>/wrist/box_poses/ per the
 # box-poses-co-located-with-trajectory convention (see dev_log 2026-05-22).
-/boxes/*.ply
+# Legacy color references in boxes/ root are kept (pushed as reference assets).
