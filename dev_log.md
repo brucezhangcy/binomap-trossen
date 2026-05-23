@@ -992,7 +992,7 @@ The adopted approach: translation-based per-arm shifts with **start-only decay**
 
 | Flag | Purpose |
 |---|---|
-| `--mode {scale, translate}` | Paper's Eq. 11 scaling (default) vs. constant translation. Translation preserves the demo's inter-arm distance evolution; scaling shrinks it uniformly per iteration. |
+| `--mode {scale, translate}` | Paper's Eq. 4 (§3.3.2) scaling (default) vs. constant translation. Translation preserves the demo's inter-arm distance evolution; scaling shrinks it uniformly per iteration. |
 | `--apply-to {primary, both}` | Single arm (paper) vs. bilateral. Bilateral is needed when the demo lacks a clear primary-secondary roles. |
 | `--lateral-spread-mm`, `--lower-mm` | Translation knobs (constant shift for entire trajectory; box-decoupled). |
 | `--shift-R-y-start-mm`, `--lower-R-start-mm` | **Start-only** shifts per arm, decay linearly to 0 by the arm's last valid frame. Preserves demo end pose. Add `_L_` variants for L. |
@@ -1047,7 +1047,7 @@ python replay_real.py --max-step-delta 0.2 --d455 low
 
 - **Gripper offset is essential.** Running `replay_trossen_ik.py` *without* `--gripper_offset_m 0.09` makes the IK target link_6 (the wrist) at the trajectory point, but the gripper tip then projects 9 cm *forward* of that — meaning the tips end up ~6 cm closer to each other than the human's fingertips were, and a box that fit the human's hands no longer fits the robot's. The user's commit `b4c76cd` (gripper-tip-at-wrist via `tip_offset_local`) makes this a one-line fix.
 - **The `_start` shift formulation matters.** Constant `--lower-R-mm` shifts R uniformly across all 220 frames; R's end-of-motion pose ends up at a different absolute location. Visible as "the trajectory shrunk." The `_start` variants apply the shift only at the arm's first valid frame and decay it linearly to 0 by the last valid frame — R's end pose matches the demo exactly.
-- **The translate vs scale split.** Paper's scale mode (Eq. 11) shrinks the inter-arm gap uniformly across all frames. For our box-pivot demo, this can collapse the gap at the pivot apex (where L and R were already close in the demo) — visible as "grippers crash." Translate mode avoids this entirely.
+- **The translate vs scale split.** Paper's scale mode (Eq. 4 in §3.3.2 — the 3D radial rescale `p̄_R = p_L + s·(p_R − p_L)`) shrinks the inter-arm gap uniformly across all frames. For our box-pivot demo, this can collapse the gap at the pivot apex (where L and R were already close in the demo) — visible as "grippers crash." Translate mode avoids this entirely.
 - **Z safety budget vs Y safety budget.** Z safety is well-defined (gripper tip height above box top). Y safety is geometry-dependent (depends on R's approach axis and gripper orientation under `--position_only`). When unlocking y for iteration, expect the iteration to be less predictable since gripper orientation is free.
 
 ---
@@ -1313,14 +1313,6 @@ Verified on recordings_2 K=11: |Δ|=57 mm, target_L/R differed by 57 mm, but `jo
 
 **Fix:** added `--out-log <path>` to [`replay_trossen_ik.py`](replay_trossen_ik.py); [`box_align_pipeline.py`](box_align_pipeline.py) now passes the box-aligned name directly so the baseline log is never opened for writing. Hardware replay can fall back to `trossen_replay_ik_log.npz` (un-aligned K=11) at any time without rebuilding it.
 
-### Tightened K=11: R-y-start −30 → −20 mm (10 mm closer to box's −y face)
-
-Box-align translates without changing inter-arm geometry, so once the demo is placed correctly the only remaining knob is the contact-adjustment safety budget. Brought R one notch tighter:
-
-- Old K=11 bundle: `trajectory_contact_adj_K11_Ronly_dRyStart-30_dRzStart-30.npz` (now deleted)
-- New K=11 bundle: `trajectory_contact_adj_K11_Ronly_dRyStart-20_dRzStart-30.npz`
-
-Generated from `trajectory_smoothed.npz` with `contact_adjustment.py --shift-R-y-start-mm -20 --lower-R-start-mm 30`. Inter-arm 3D distance is essentially unchanged (min 314 mm both old and new); R min wrist z still 185.3 mm. K=11 in the iteration table now reads −20/−30 instead of −30/−30.
 
 ### Hardware command (post-pipeline)
 
@@ -1338,3 +1330,218 @@ Drop `--d455 low` if you don't want the workspace-cam recording.
 - The "delete original IK log on diagnostic" failure mode happened twice during dev — once because the pipeline overwrote, and once because a diagnostic `replay_trossen_ik.py` invocation wrote the default-named log. The `--out-log` flag closes the pipeline path; for ad-hoc diagnostics, copy the log to a `_backup.npz` first.
 - Hardware replay still expects `--max-step-delta 0.2`. The box-align Δ (~5 cm) shows up as a few-cm offset of the entire joint trajectory, not as a single-frame jump, so the step-delta limit doesn't gate it.
 - Δz is zeroed by default (`--apply-dz` to keep). Rationale: the table is fixed in our setup, so any z component of the box AABB delta is point-cloud noise rather than real motion. Empirically Δz observed at <5 mm so far.
+
+---
+
+## 2026-05-23 — Stage 3: Category-Level Primitive Parameterization (BiNoMaP §3.4)
+
+Generalize the K=11 brown-box success trajectory to other boxes in the same category via the paper's single non-iterative geometric step. The L arm and all orientations are unchanged; only R-arm position is rescaled radially along the inter-arm axis.
+
+### What §3.4 contributes vs reuses
+
+§3.4 contributes **only Eq. 5** (the δsize calculation from object point clouds). The trajectory update reuses **Eq. 4 from §3.3.2** — the same Stage 2b scale-mode 3D radial rescale we deliberately avoided on K=11 brown by choosing translate-mode.
+
+Verbatim from §3.4:
+
+> "The size difference δsize between the new and base instances is then incorporated into our contact optimization **Eqn. 4** in a single, non-iterative step to adapt the trajectory."
+
+The two equations:
+
+```
+# Eq. 5 (§3.4) — δsize from object point clouds:
+δsize = max_{u,v ∈ pcd_new} ‖u − v‖₂  −  max_{u,v ∈ pcd_base} ‖u − v‖₂
+        s.t. (u − v) ∥ (p̂^{t_s}_L − p̂^{t_s}_R)
+        # paper: "taking a horizontal slice at the initial contact height"
+
+# Eq. 4 (§3.3.2) — trajectory update, applied to full 3D inter-arm vector:
+s(t)   = (‖p_R[t] − p_L[t]‖ + δsize) / ‖p_R[t] − p_L[t]‖
+p̄_R[t] = p_L[t] + s(t) · (p_R[t] − p_L[t]),  ∀t ∈ [t_s, t_e]
+```
+
+`t_s` = **starting point** of the contact phase (first frame where both arms are valid); `t_e` = last such frame. `û` is computed once at `t_s` from `(p_L[t_s] − p_R[t_s]) / ‖·‖` and held fixed across the whole contact phase. Frames outside `[t_s, t_e]` pass through unmodified.
+
+### Script + pipeline
+
+[category_parameterize.py](category_parameterize.py) implements Eq. 5 (via `extent_along(pts, û) = max(proj) − min(proj)`, algebraically equivalent to the chord-max under the parallel constraint) and Eq. 4 (per-frame, 3D). One **minor deviation** from the paper spec: uses the full point cloud instead of a horizontal slice at contact height — equivalent for prismatic objects (boxes), not for tapered objects.
+
+CLI:
+```bash
+python category_parameterize.py \
+    --in_npz   outputs/recordings_2/wrist/trajectory_contact_adj_K11_Ronly_dRyStart-20_dRzStart-30.npz \
+    --base_ply boxes/brown_box.ply \
+    --new_ply  boxes/wifi_box.ply
+```
+
+Downstream pipeline is unchanged — Stage 3 outputs the same bundle schema as Stage 2b plus traceability arrays (`p_R_pre_param`, `cat_param_delta_size_m`, `cat_param_inter_arm_unit`, `cat_param_t_s/t_e`):
+
+```
+category_parameterize.py → trajectory_K11_paramto_<target>.npz
+[ box_align_pipeline.py ] → optional Δxy alignment
+replay_trossen_ik.py     → IK log
+replay_real.py           → hardware
+```
+
+### Hardware results: all four targets failed to flip
+
+Generated and tested all four available boxes against the brown-base trajectory (no box-align, no extension). All failed — no contact made in any case.
+
+| Target | δsize | height gap vs brown | sim s(t) max\|−1\| | hardware result |
+|---|---:|---:|---:|---|
+| black_box        | −17.8 mm | −28 mm |  5.7% | no contact |
+| amazon_brown_box | −31.4 mm | −60 mm | 10.0% | no contact |
+| blue_box         | −33.4 mm | −23 mm | 10.7% | no contact |
+| wifi_box         | −74.7 mm | −74 mm | 23.8% | no contact |
+
+Two consistent failure modes:
+
+1. **R wrist starts too high above the new box's top.** R wrist min z stays near brown's ~185 mm; new box tops sit at 108–159 mm. R hovers 20–73 mm above the new box from the very start, so the contact phase never engages.
+2. **Inter-arm separation, even after rescale, is still too wide for the gripper tips to close on the box sides.** Likely contributing causes (any/all): brown's pinch min already had only ~8 mm/side clearance (no margin for mismatch), SAM2-captured AABB widths may over-estimate the physical box (table pixels at the edge), and gripper-tip orientation `R_R` is set by the demo and may face the smaller box at a slightly off angle.
+
+### Why it failed — and why the script isn't the bug
+
+Audited [category_parameterize.py](category_parameterize.py) line-by-line against the paper: Eq. 4 ([L109-117](category_parameterize.py#L109-L117)), Eq. 5 ([L100-104](category_parameterize.py#L100-L104)), û at t_s ([L94-98](category_parameterize.py#L94-L98)), and the L-arm-untouched invariant all check out. **The script is a faithful implementation of §3.4 + Eq. 4.**
+
+The failures are failures of the **paper's category assumption**, not of the implementation:
+
+- §3.4 implicitly assumes "same category" = "differs primarily in inter-arm-axis extent at the contact-height slice." Height variation and contact-surface geometry are assumed to match.
+- The paper's natural use case is **side-grasp at matched heights** (e.g., grasping a vase from both sides): L_z ≈ R_z, the inter-arm vector is roughly horizontal, and Eq. 4's z scaling is ~0 — z is preserved.
+- Our box-flip demo violates this. L is *below* the box (~140 mm), R is *above* (~350 mm), so the inter-arm vector has ~200 mm of z. Eq. 4's multiplicative rescale does change R's z by `(1 − s)·(p_R_z − p_L_z)` (e.g. 38 mm for wifi) — **but this z change is set by the demo geometry, not by the new box**. It's a side effect, not a correction. For wifi, the demo gives 38 mm of drop when 74 mm is needed; for a taller box it could push R the wrong direction entirely.
+
+### Implication
+
+Strict §3.4 is not sufficient for our box-flip category as-captured. Two paths forward:
+
+1. **Stay paper-compliant** — reshoot the base demo on an object that better matches targets in height, so the inter-arm vector is closer to horizontal and Eq. 4's behavior matches the paper's assumption.
+2. **Extend beyond §3.4** — add an additive `δheight = new_top_z − base_top_z` R-z lower term, and probably a few Stage-2b iterations on top of the §3.4 output to tighten the pinch contact. Both would be deliberate paper-departures.
+
+Box-align Δxy alone (§3.3) won't help — the issue is shape mismatch, not position.
+
+### Update: physical-flip workaround for the height limitation works (wifi + amazon succeed)
+
+Instead of extending the algorithm with a `δheight` term, the demonstrator physically **flipped the box onto a different face** so the box's z-extent in world matches the brown base. With the new orientation, the target box's *top* sits at roughly brown's top height, so the trajectory's R-wrist (which still terminates at brown's box-top z) now grazes the new box's top correctly.
+
+For this to flow through, **`--apply-dz` must be enabled on `box_align_pipeline.py`** (default is to zero Δz since the table is fixed; for this workaround the box has been physically lifted, so Δz is real and must propagate). Pipeline used:
+
+```bash
+/home/yunshuang/anaconda3/envs/depth_lerobot/bin/python box_align_pipeline.py \
+    --success-ply outputs/recordings_2/wrist/box_poses/success_K11_brown.ply \
+    --trajectory  outputs/recordings_2/wrist/trajectory_K11_paramto_<target>.npz \
+    --apply-dz
+```
+
+Captures a fresh `current.ply` (interactive SAM2 click on both cams) at the box's new flipped pose, computes Δxyz, translates the Stage-3 paramto bundle by the full 3D Δ, runs sim IK with `--rot-weight 0.2 --gripper_offset_m 0.09`, and prints the hardware command.
+
+**Hardware results:**
+
+| Target | Pipeline run | Box-aligned IK log | Hardware result |
+|---|---|---|---|
+| wifi_box        | 2026-05-23 14:41 | `outputs/recordings_2/wrist/trajectory_K11_paramto_wifi_box_box_aligned_iklog.npz`        | **✓ box flipped** |
+| amazon_brown_box | 2026-05-23 14:57 | `outputs/recordings_2/wrist/trajectory_K11_paramto_amazon_brown_box_box_aligned_iklog.npz` | **✓ box flipped** |
+| black_box       | (pending)        | `outputs/recordings_2/wrist/trajectory_K11_paramto_black_box_box_aligned_iklog.npz`        | (in progress) |
+| blue_box        | (pending)        | —                                                                                          | — |
+
+**What the workaround actually exploits.** Stage 3's §3.4 only adjusts inter-arm extent, not height. Manually re-orienting the target box reshapes its world-frame AABB so the *new* z-extent matches brown's. Then the Stage-3 paramto bundle (which assumed brown's height) plus a full-3D box-align translation (with `--apply-dz`) is geometrically correct: width is handled by §3.4's rescale, height is handled by physical reorientation, position is handled by Δxyz. No algorithm extension, no second `δheight` term.
+
+**Caveat — δsize may now be slightly off.** The Stage-3 paramto bundles were generated using the original (un-flipped) `boxes/<name>.ply` size references, which captured the boxes in their *original* orientation. After flipping, the dimension that's now along the inter-arm axis may differ from what δsize assumed. For wifi (−74.7 mm) and amazon (−31.4 mm) it was close enough that the in-flight pinch still worked. If a flip changes which face is up dramatically (>30 mm extent change along û), re-capture the size reference with the new orientation and re-run Stage 3 before box-align.
+
+### Note on `u, v` naming
+
+In the paper's Eq. 5 formula, `u` and `v` are **point-cloud coordinates** (two points whose chord is parallel to the inter-arm axis). In [category_parameterize.py:94](category_parameterize.py#L94) the local variable `v` is unrelated — it's the unnormalized inter-arm vector `p_L[t_s] − p_R[t_s]`. Same letter, different concept; only `δsize` (the chord-max difference) flows between them.
+
+---
+
+## 2026-05-23 (later) — recording_rotation: hand-detection failure, framing fix, pipeline tuning for rotation tasks
+
+New demo `recording_rotation/` — bimanual rotation of the brown box (no flipping, just rotation in place). Took two attempts; pipeline needed two new flags. Documenting what went wrong, what fixed it, and what's now permanent in the scripts.
+
+### First take: both detectors returned ~0 valid frames
+
+`recording_rotation/` v1 (6 s, 30 fps, `--no-park`, both D455 workspace cams). Ran extraction with the standard pipeline:
+
+| Detector | L cam valid | R cam valid | Bimanual grid |
+|---|---:|---:|---:|
+| MediaPipe (`extract_trajectory_mediapipe.py`) | 1/174 | 0/173 | valid_L=2, valid_R=0 (of 183) |
+| WiLoR (`extract_trajectory.py`, installed for this test — see install notes below) | 1/174 | 0/173 | valid_L=2, valid_R=0 (of 183) |
+
+**Both detectors identical** → not a detector-specific issue. Inspected raw frames:
+
+- **R cam (338122302972):** the rotation action was mostly outside the frame — mostly empty table with a sleeve visible in one corner. Zero detections is consistent with "no hand actually in frame."
+- **L cam (333422304645):** hands visible but in unusual top-down configuration with **dark long sleeves** coming down — high-contrast skin-to-clothing transition was hidden, and the wrist/forearm context the detectors rely on was occluded.
+
+### Fix: remove sleeves + stand at the back of the table
+
+Empirical fix from the demonstrator. The key changes between take 1 and take 2:
+
+1. **Removed long sleeves.** Bare forearms gave both detectors the wrist-to-forearm transition they're trained on. Box-flip recordings_2 had the same lesson implicitly (rolled-up sleeves).
+2. **Stood at the back of the table** (rather than the side). This put both hands in the *center* of both cameras' FOV during the rotation motion instead of one hand drifting into the R cam's corner. The rotation action now lives inside the intersection of the two camera frustums for the whole 6 s.
+
+No script change, no detector switch. Pure recording-side fix.
+
+### Second take: clean extraction
+
+Same 6 s `--duration 6 --countdown 3 --no-park` recording, just with the two fixes above:
+
+| Detector | L cam valid | R cam valid | Bimanual grid |
+|---|---:|---:|---:|
+| MediaPipe (`extract_trajectory_mediapipe.py`) | 168/179 (94%) | 179/179 (100%) | valid_L=159, valid_R=177 (of 182) |
+
+94% / 100% per-cam, 87% / 97% on the bimanual grid. Plenty of data for downstream stages.
+
+Side note: MediaPipe's `side_detected` was unreliable (L cam called the hand "R" in 145 frames, R cam called it "L" in 168 frames). Doesn't matter — the script's camera-expected-side fallback assigns correctly. Worth knowing if anything ever depends on MediaPipe's intrinsic handedness label.
+
+### Local install: WiLoR is now available on coldbrew
+
+When MediaPipe failed on take 1 I installed WiLoR locally to rule out detector-specific bias. Steps (records for future reproducibility on this host):
+
+```bash
+# 1. chumpy (legacy SMPL/MANO dependency) — fails to build in isolated build env on Py 3.10
+/home/yunshuang/anaconda3/envs/depth_lerobot/bin/pip install --user --no-build-isolation chumpy
+
+# 2. chumpy 0.70 broke on numpy>=1.24 (np.bool/int/float aliases removed). Patch:
+sed -i 's|from numpy import bool, int, float, complex, object, unicode, str, nan, inf|from numpy import nan, inf|' \
+    /home/bruce/.local/lib/python3.10/site-packages/chumpy/__init__.py
+
+# 3. Now wilor-mini itself
+/home/yunshuang/anaconda3/envs/depth_lerobot/bin/pip install --user --no-build-isolation \
+    git+https://github.com/warmshao/WiLoR-mini
+
+# 4. Model checkpoints auto-download from HuggingFace on first pipeline construction
+#    (~500 MB into ~/.local/lib/python3.10/site-packages/wilor_mini/pretrained_models/)
+```
+
+Side effects to be aware of:
+- pip downgraded torch 2.11 → 2.5 in depth_lerobot's `--user` site-packages to satisfy wilor-mini's pins. Re-check if torchvision/sam-2/lerobot complain about version mismatch in future work.
+- Confirmed `extract_trajectory.py` (WiLoR variant) runs end-to-end in depth_lerobot env after install.
+
+### Pipeline tuning needed for rotation-class tasks
+
+Rotation differs from box-flip in two ways that exposed pre-existing rough edges:
+
+**1. Back-fill plateau visible in sim warmup.** L's first valid frame was 6 (R's was 0), so frames 0–5 were back-filled to a duplicate of frame 6. During MuJoCo's 2 s warmup, the arm tried to move from all-zeros home to a non-trivial back-fill pose, producing a wild visible twist. Hardware was fine (slow_move_to handles it), but the sim viz was misleading.
+
+**Fix added:** `--auto-skip-leading-invalid` flag on `replay_trossen_ik.py` (mirrors the same-named flag on `replay_real.py`). Drops frames before `max(first_valid_L, first_valid_R)` so the bundle starts at the first frame where both arms have real data. Reduces max frame-to-frame joint Δ from 24.5° → 13.2° at start.
+
+**2. Mean-anchor orientation remap drifts for large-rotation demos.** `replay_trossen_ik.py`'s default `--orientation_remap` computes the IK orientation target as `R_remap @ R_hand[k]`, where `R_remap` is derived from the **mean** quaternion across all valid frames. For box-flip (palm orientation roughly constant) this works fine. For rotation (R palm sweeps ~170° across the demo), the mean is a meaningless halfway pose and the gripper tip drifts off the palm direction by varying amounts — early frames tilted ~85° one way, mid frames matched, late frames tilted ~85° the other way. Symptom: "the tip is not always facing where my palm is facing."
+
+**Fix added:** `--fixed-orientation-remap` flag on `replay_trossen_ik.py`. Uses a fixed `R_align` (default `R_y(-90°)` mapping gripper-+x onto palm normal, same as `replay_trossen_paper.py`) applied per-frame as `R_target[k] = R_hand[k] @ R_align`. No averaging. Combined with `--rot-weight 0.2` (soft DoF, also default for our setup) this gives:
+- IK pos err 0.4 mm mean / 1.0 mm max
+- IK rot err **0.1° mean / 0.9° max** (vs the mean-anchor variant's drift)
+- ~half the frames take the soft-fallback to position-only (graceful degradation on unreachable orientations)
+
+Default behavior is unchanged when the flag is off — existing box-flip / K-iteration pipelines aren't affected.
+
+### Stage 2b iteration on rotation (in progress)
+
+After the orientation fix, started the geometric-aware contact-adjustment sweep. Goal: tighten the R-arm's pinch on the box's −y face for a firm rotation grip.
+
+| K | shift-R-y-start | lower-R-start | Hardware result |
+|---|---:|---:|---|
+| 1 | +20 mm | 0 | a little loose — increase tightening, unlock z |
+| 2 | +30 mm | +20 mm | *(in progress)* |
+
+Iteration continues. Pattern matches box-flip K-sweep: start conservative, progress to tighter grip, stop when contact is reliable.
+
+### What's permanent vs what was throwaway
+
+- **Permanent:** `--auto-skip-leading-invalid` and `--fixed-orientation-remap` on `replay_trossen_ik.py`. WiLoR install on coldbrew. The "no sleeves + stand at back" recording protocol.
+- **Throwaway (kept for reference):** `outputs/recording_rotation/wrist/replay_paper.mp4` and `trossen_replay_paper_log.npz` — the diagnostic paper-strict run that confirmed fixed R_align was the right fix before we added the soft+fixed combo flag.

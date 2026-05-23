@@ -254,9 +254,38 @@ def main():
                          "<in_npz_parent>/trossen_replay_ik_log.npz "
                          "(callers — e.g. box_align_pipeline.py — that don't want to "
                          "clobber the existing default-named log should pass this).")
+    ap.add_argument("--auto-skip-leading-invalid", action="store_true",
+                    help="Drop frames before max(first_valid_L, first_valid_R) so "
+                         "the trajectory starts at the first frame where BOTH arms "
+                         "have real data. Removes the back-fill plateau that "
+                         "otherwise causes a startup jolt during warmup. Mirrors "
+                         "the same-named flag in replay_real.py.")
+    ap.add_argument("--fixed-orientation-remap", action="store_true",
+                    help="Use a FIXED per-frame remap R_target[k] = R_hand[k] @ R_align "
+                         "(matching replay_trossen_paper.py) instead of the default "
+                         "mean-anchor learned remap. Right for tasks where the palm "
+                         "rotates substantially across the demo (e.g. box rotation) — "
+                         "the mean-anchor approach averages out the rotation and the "
+                         "gripper tip drifts off-axis. Default R_align maps gripper-+x "
+                         "(tool axis) onto hand-+z (palm normal).")
+    ap.add_argument("--align-euler-deg", default="0,-90,0",
+                    help="Euler ZYX degrees defining R_align for --fixed-orientation-remap. "
+                         "Default '0,-90,0' = R_y(-90°) → gripper-+x along palm normal.")
     args = ap.parse_args()
 
-    bundle = np.load(args.in_npz)
+    bundle = dict(np.load(args.in_npz))
+    if args.auto_skip_leading_invalid:
+        vL_full = bundle["valid_L"].astype(bool)
+        vR_full = bundle["valid_R"].astype(bool)
+        wL = np.where(vL_full)[0]; wR = np.where(vR_full)[0]
+        if len(wL) and len(wR):
+            t0 = int(max(wL[0], wR[0]))
+            if t0 > 0:
+                print(f"--auto-skip-leading-invalid: dropping frames 0..{t0-1} "
+                      f"(L first valid={wL[0]}, R first valid={wR[0]})")
+                for k, v in list(bundle.items()):
+                    if isinstance(v, np.ndarray) and v.ndim >= 1 and v.shape[0] == len(vL_full):
+                        bundle[k] = v[t0:]
     ts_ms = bundle["ts_ms"]
     p_L = bundle["p_L"].copy()
     q_L = bundle["q_L"]
@@ -329,7 +358,25 @@ def main():
     # the EE's natural rest orientation at the home keyframe. Later frames
     # inherit the same offset, so the *relative* orientation evolution from
     # the human video is preserved while the absolute frame is aligned.
-    if args.orientation_remap and not args.position_only:
+    if args.fixed_orientation_remap and not args.position_only:
+        # FIXED R_align (matches replay_trossen_paper.py). Per-frame:
+        #   R_gripper_target[k] = R_hand[k] @ R_align
+        # No averaging. Right for tasks where the palm rotates substantially.
+        rx, ry, rz = [float(x) for x in args.align_euler_deg.split(",")]
+        # Same euler_zyx convention as replay_trossen_paper.py: R = Rz @ Ry @ Rx
+        rxr, ryr, rzr = np.deg2rad([rx, ry, rz])
+        Rx = np.array([[1,0,0],[0,np.cos(rxr),-np.sin(rxr)],[0,np.sin(rxr),np.cos(rxr)]])
+        Ry = np.array([[np.cos(ryr),0,np.sin(ryr)],[0,1,0],[-np.sin(ryr),0,np.cos(ryr)]])
+        Rz = np.array([[np.cos(rzr),-np.sin(rzr),0],[np.sin(rzr),np.cos(rzr),0],[0,0,1]])
+        R_align = Rz @ Ry @ Rx
+        print(f"orientation remap: FIXED R_align (euler ZYX {rx},{ry},{rz}°)")
+        print(f"  gripper-local +x → {(R_align @ np.array([1,0,0])).round(3)} in hand frame")
+        for k in range(N):
+            R_ours_L = quat_wxyz_to_rotmat(q_L_mj[k])
+            q_L_mj[k] = rotmat_to_quat_wxyz(R_ours_L @ R_align)
+            R_ours_R = quat_wxyz_to_rotmat(q_R_mj[k])
+            q_R_mj[k] = rotmat_to_quat_wxyz(R_ours_R @ R_align)
+    elif args.orientation_remap and not args.position_only:
         # Need the EE's rest orientation in world frame after kinematics
         mujoco.mj_kinematics(model, data)
         rest_qL_mj = data.xquat[arm_L[3]].copy()  # (w, x, y, z) in world
@@ -338,6 +385,10 @@ def main():
         # spreads the IK reachability load across the whole trajectory instead
         # of overfitting to the first frame (where R might happen to be in a
         # reachable corner but L drifts out as the trajectory evolves).
+        # ⚠ For demos with large palm-rotation range (e.g. rotating an object),
+        # the mean is a meaningless "average" pose and the gripper tip drifts
+        # off the palm direction by varying amounts across the trajectory.
+        # Use --fixed-orientation-remap in that case.
         anchor_qL = mean_quat_xyzw(q_L, valid_L)
         anchor_qR = mean_quat_xyzw(q_R, valid_R)
         R_remap_L = compute_orientation_remap(rest_qL_mj, anchor_qL)
