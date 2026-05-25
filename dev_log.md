@@ -1530,18 +1530,68 @@ Rotation differs from box-flip in two ways that exposed pre-existing rough edges
 
 Default behavior is unchanged when the flag is off — existing box-flip / K-iteration pipelines aren't affected.
 
-### Stage 2b iteration on rotation (in progress)
+### Stage 2b iteration on rotation — converged on iter2_scale_dRzStart20
 
-After the orientation fix, started the geometric-aware contact-adjustment sweep. Goal: tighten the R-arm's pinch on the box's −y face for a firm rotation grip.
+Goal: tighten the R-arm's pinch on the box's −y face for a firm rotation grip. After deleting an initial custom-translate sweep (K1–K3 above), switched to **paper iteration mode** (`--iteration K` with `d_k = 5 × 0.85^(K-1)` mm) chained with a custom z-lower pass.
 
-| K | shift-R-y-start | lower-R-start | Hardware result |
-|---|---:|---:|---|
-| 1 | +20 mm | 0 | a little loose — increase tightening, unlock z |
-| 2 | +30 mm | +20 mm | *(in progress)* |
+| Variant | Pipeline | Hardware result |
+|---|---|---|
+| Custom K1 (+20 y, 0 z) | `--shift-R-y-start-mm 20` | a little loose |
+| Custom K2 (+30 y, +20 z) | `--shift-R-y-start-mm 30 --lower-R-start-mm 20` | replayed but rejected; deleted |
+| Custom K3 (+40 y, +30 z) | `--shift-R-y-start-mm 40 --lower-R-start-mm 30` | generated but rejected; deleted |
+| Paper iter 1 (d_k=5 mm, scale) | `--iteration 1` | replayed |
+| **Paper iter 2 + R z −20 mm (final)** | `--iteration 2` chained → `--lower-R-start-mm 20` | **✓ canonical rotation baseline** |
 
-Iteration continues. Pattern matches box-flip K-sweep: start conservative, progress to tighter grip, stop when contact is reliable.
+**Canonical bundles for downstream work** (Stage 3 generalization, box-align, hardware replay):
+
+- Trajectory bundle: `outputs/recording_rotation/wrist/trajectory_contact_adj_iter2_scale_dRzStart20.npz`
+- Sim IK log: `outputs/recording_rotation/wrist/trossen_replay_ik_log_iter2_scale_dRzStart20.npz`
+- Sim mp4: `outputs/recording_rotation/wrist/replay_iter2_scale_dRzStart20.mp4`
+
+Built with `--rot-weight 0.2 --auto-skip-leading-invalid --fixed-orientation-remap --gripper_offset_m 0.09`. Any future Stage 3 paramto or box-align run for the rotation task should chain off this bundle (the same role K=11 brown plays for box-flip).
+
+Chain pattern (one-time):
+```bash
+# Pass 1: paper Eq. 4 with d_k = 4.25 mm
+python contact_adjustment.py \
+    --smoothed outputs/recording_rotation/wrist/trajectory_smoothed.npz \
+    --object-ply boxes/brown_box.ply \
+    --iteration 2
+
+# Pass 2: R z-lower decay on top of the iter2 output
+python contact_adjustment.py \
+    --smoothed outputs/recording_rotation/wrist/trajectory_contact_adj_iter2_scale.npz \
+    --object-ply boxes/brown_box.ply \
+    --lower-R-start-mm 20 \
+    --tag iter2_scale_dRzStart20
+```
+
+Two passes because `contact_adjustment.py` runs in either paper-iteration mode OR lateral-shift mode per invocation, not both — chaining is the workaround.
 
 ### What's permanent vs what was throwaway
 
 - **Permanent:** `--auto-skip-leading-invalid` and `--fixed-orientation-remap` on `replay_trossen_ik.py`. WiLoR install on coldbrew. The "no sleeves + stand at back" recording protocol.
 - **Throwaway (kept for reference):** `outputs/recording_rotation/wrist/replay_paper.mp4` and `trossen_replay_paper_log.npz` — the diagnostic paper-strict run that confirmed fixed R_align was the right fix before we added the soft+fixed combo flag.
+
+---
+
+## Hardware success-rate tracking — flip + rotate, all targets
+
+Per-target, per-task hardware success rate. Update cells after each batch of trials. Counted as `successes / trials`.
+
+For **flip**, two separate criteria:
+- **Perfect stand at end** — box ends upright on the table, flush with the surface (no tilt).
+- **<10° tilt** — looser bar; box ends standing but slightly leaned.
+
+For **rotate**, single criterion: box ends rotated to the intended orientation with full contact maintained throughout the motion.
+
+| Target | Pose variant | Flip — perfect stand | Flip — <10° tilt | Rotate |
+|---|---|---:|---:|---:|
+| brown_box | flat (default)       | / | / | **3/15** |
+| brown_box | higher (`brown_box_2.ply`, top z 295 mm) | / | / | **0/15** |
+| blue_box  | —                    | / | / | **0/15** |
+| black_box | —                    | / | / | **1/15** |
+| plastic_box | —                  | / | / | **0/15** |
+| wifi_box  | —                    | / | / | **0/15** |
+
+**How to read the columns** — flip results use the K=11 brown-base trajectory generalized via Stage 3 (`trajectory_K11_paramto_<target>.npz`) + `box_align_pipeline.py --apply-dz`; rotate results use the rotation canonical baseline (`trajectory_contact_adj_iter2_scale_dRzStart20.npz`) generalized per target the same way. Fill cells as `N/M` (e.g. `3/5`) so the trial count is preserved alongside the rate.

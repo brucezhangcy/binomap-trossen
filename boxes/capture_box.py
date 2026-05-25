@@ -56,7 +56,10 @@ WARMUP_FRAMES = 30
 WORKSPACE_MIN = np.array([-0.6, -0.6, -0.05])
 WORKSPACE_MAX = np.array([ 0.6,  0.6,  0.40])
 
-CLUSTER_EPS_M = 0.015
+CLUSTER_EPS_M = 0.008  # tightened from 0.015 (May 2026): a 15 mm eps was
+                       # bridging the box's masked points to nearby objects via
+                       # depth speckle, producing a "two-box" merged cloud.
+                       # 8 mm separates them reliably for boxes on a table.
 CLUSTER_MIN_POINTS = 30
 
 
@@ -121,6 +124,30 @@ def capture_click(rgb: np.ndarray, serial: str, name: str) -> tuple[int, int]:
     return clicked["xy"]
 
 
+def preview_and_confirm_mask(rgb: np.ndarray, mask: np.ndarray, serial: str) -> bool:
+    """Show SAM2 mask overlay on the RGB frame. Return True to accept, False to retry."""
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy()
+    overlay = bgr.copy()
+    overlay[mask] = (0, 255, 0)
+    blended = cv2.addWeighted(bgr, 0.5, overlay, 0.5, 0)
+    cv2.putText(blended, "y = accept   n / any key = re-click   ESC = abort",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    winname = f"cam {serial}: SAM2 mask preview"
+    cv2.namedWindow(winname, cv2.WINDOW_NORMAL)
+    while True:
+        cv2.imshow(winname, blended)
+        k = cv2.waitKey(20) & 0xFF
+        if k == 27:
+            cv2.destroyWindow(winname)
+            raise RuntimeError(f"[{serial}] preview cancelled (ESC)")
+        if k == ord('y'):
+            cv2.destroyWindow(winname)
+            return True
+        if k != 255:
+            cv2.destroyWindow(winname)
+            return False
+
+
 def sam2_mask_from_point(predictor, rgb: np.ndarray, point: tuple[int, int]) -> np.ndarray:
     predictor.set_image(rgb)
     masks, scores, _ = predictor.predict(
@@ -177,6 +204,11 @@ def main() -> None:
                     help=f"Where to save the PLYs. Default: {OUTPUT_DIR}")
     ap.add_argument("--no-viewer", action="store_true",
                     help="Skip the final Open3D viewer; just write the PLYs and exit.")
+    ap.add_argument("--preview-mask", action="store_true",
+                    help="After each SAM2 click, show the mask overlay and wait for "
+                         "y=accept / any other key=retry / ESC=abort. Prevents the "
+                         "'two boxes in cloud' problem when SAM2 spills onto adjacent "
+                         "objects with similar color/texture.")
     args = ap.parse_args()
 
     if not EXTRINSICS_JSON.exists():
@@ -200,10 +232,17 @@ def main() -> None:
         full.transform(np.array(entry["transform_camera_to_world"]))
         scene += full
 
-        print(f"[{serial}] click the {args.name.replace('_', ' ')}…")
-        point = capture_click(rgb, serial, args.name)
-        print(f"  click at pixel {point}")
-        mask = sam2_mask_from_point(predictor, rgb, point)
+        # Click loop: re-click until preview accepted (or skip preview entirely).
+        while True:
+            print(f"[{serial}] click the {args.name.replace('_', ' ')}…")
+            point = capture_click(rgb, serial, args.name)
+            print(f"  click at pixel {point}")
+            mask = sam2_mask_from_point(predictor, rgb, point)
+            if not args.preview_mask:
+                break
+            if preview_and_confirm_mask(rgb, mask, serial):
+                break
+            print(f"  [{serial}] mask rejected — re-click")
 
         masked = masked_pointcloud(rgb, depth_mm, mask, entry["intrinsics"])
         masked.transform(np.array(entry["transform_camera_to_world"]))
